@@ -1,0 +1,242 @@
+"""Panther-style IVF ANN under symmetric privacy.
+
+This program ports PANTHER's clustering ANN (Li et al., USENIX Sec 2025,
+Sec. 2.1.4) into a fully secret-shared setting:
+
+  - Database vectors are secret-shared across the three MP-SPDZ parties.
+  - The query vector is secret-shared.
+  - Cluster member access is via DORAM (replacing PANTHER's plaintext-DB
+    PIR with an oblivious data structure that hides which bin is touched).
+  - Distance computations are evaluated in MPC over secret-shared inputs.
+
+Algorithm (matches PANTHER's three-step routine):
+
+  1. Compute secret distance from the query to each of the t cluster
+     centroids in plaintext-traversal order.  All t distances are
+     produced; selecting the top-u via secure sort hides which clusters
+     were probed.
+  2. Issue u DORAM reads against the bin store.  Each ORAM entry holds
+     one full bin (bin_size members, each D dimensions, plus its
+     original id), so that the bin-level access pattern is hidden.
+  3. Compute secret distance to every fetched member, then secure top-K.
+
+Compile-time arguments (all positional):
+
+    panther_ivf_doram <N> <D> <t> <bin_size> <u> <K> <ID_BITS> <DIST_BITS>
+
+Runtime environment:
+
+    ORAM_IMPL    optimal | recursive | linear   (default optimal)
+
+Input wire format (matches the convention used by hnsw_layer_search.mpc
+and hnsw_search.mpc: every secret value is supplied as three additive
+shares from parties 0/1/2):
+
+    centroids       t * D       sints
+    bins            t * bin_size * D   sints
+    bin_ids         t * bin_size       sints
+    query           D           sints
+
+The total length of the secret-input stream is therefore
+    t * D + t * bin_size * (D + 1) + D
+sints, each repeated three times (one per party).
+
+Output:
+
+    K lines of  "id=<...>  dist=<...>"  with the revealed top-K result.
+"""
+
+import math
+import os
+
+from Compiler.library import for_range, print_ln
+from Compiler.types import Array, sint
+from oram import OptimalORAM, RecursiveORAM, LinearORAM
+
+
+def _oram_class(name):
+    if name == "linear":
+        return LinearORAM
+    if name == "recursive":
+        return RecursiveORAM
+    return OptimalORAM
+
+
+# ---- arguments ----------------------------------------------------------
+
+N        = int(program.args[1])
+D        = int(program.args[2])
+T        = int(program.args[3])     # cluster count, conventionally ~ sqrt(N)
+BIN_SIZE = int(program.args[4])     # max members per bin (padded with dummies)
+U        = int(program.args[5])     # clusters probed per query (PANTHER's u)
+K        = int(program.args[6])     # final top-K
+ID_BITS  = int(program.args[7])
+DIST_BITS = int(program.args[8])
+
+if BIN_SIZE * T < N:
+    # caller is responsible for padding bins so that BIN_SIZE * T >= N.
+    # We do not enforce equality because the residual slots act as
+    # dummies for any bin that is undersized.
+    raise ValueError("BIN_SIZE * T < N; pad the bin store before invoking")
+
+SHIFT     = 1 << ID_BITS
+MAX_DIST  = (1 << DIST_BITS) - 1
+MAX_PAIR  = sint(MAX_DIST * SHIFT)
+
+oram_impl = os.environ.get("ORAM_IMPL", "optimal")
+oram_type = _oram_class(oram_impl)
+
+
+# ---- secret input helpers ----------------------------------------------
+
+def read_shared(size):
+    """Read `size` sints, each as the sum of three additive shares."""
+    if size == 0:
+        return Array(0, sint)
+    s0 = Array(size, sint)
+    s1 = Array(size, sint)
+    s2 = Array(size, sint)
+    s0.assign_vector(sint.get_input_from(0, binary=True, size=size))
+    s1.assign_vector(sint.get_input_from(1, binary=True, size=size))
+    s2.assign_vector(sint.get_input_from(2, binary=True, size=size))
+    out = Array(size, sint)
+
+    @for_range(size)
+    def _accum(i):
+        out[i] = s0[i] + s1[i] + s2[i]
+
+    return out
+
+
+# Each ORAM entry packs one full bin: BIN_SIZE * D vector entries plus
+# BIN_SIZE id entries.  The first BIN_SIZE * D wires are vectors, the
+# remaining BIN_SIZE wires are member ids.
+ENTRIES_PER_BIN = BIN_SIZE * (D + 1)
+bin_entry_size  = tuple([DIST_BITS] * (BIN_SIZE * D)
+                       + [ID_BITS] * BIN_SIZE)
+bin_oram = oram_type(T, value_type=sint, entry_size=bin_entry_size,
+                     init_rounds=0)
+
+
+# ---- inputs ------------------------------------------------------------
+
+centroids = read_shared(T * D)
+bin_flat  = read_shared(T * BIN_SIZE * D)
+bin_ids   = read_shared(T * BIN_SIZE)
+query     = read_shared(D)
+
+
+# Initialize bin ORAM.  Each iteration writes one bin in tuple form.
+@for_range(T)
+def _init_bins(c):
+    vec_part = tuple(bin_flat[c * BIN_SIZE * D + j]
+                     for j in range(BIN_SIZE * D))
+    id_part  = tuple(bin_ids[c * BIN_SIZE + j]
+                     for j in range(BIN_SIZE))
+    bin_oram.write(c, vec_part + id_part)
+
+
+# ---- distance + packing -------------------------------------------------
+
+def dist_l2(vec, q):
+    """L2 distance on D-dim secret vectors."""
+    acc = sint(0)
+    for j in range(D):
+        diff = vec[j] - q[j]
+        acc += diff * diff
+    return acc
+
+
+def pack_pair(dist, idx):
+    return dist * SHIFT + idx
+
+
+def unpack_pair(pair):
+    dist = pair >> ID_BITS
+    idx = pair - dist * SHIFT
+    return dist, idx
+
+
+# ---- step 1 : distance to all centroids --------------------------------
+
+# We compute t distances and pack them with the cluster index.  The
+# secret-share remains protected; the access pattern over the centroid
+# array is constant (full sweep), so it does not leak which cluster
+# wins.
+centroid_pairs = sint.Array(T)
+
+@for_range(T)
+def _centroid_pass(i):
+    cvec = [centroids[i * D + j] for j in range(D)]
+    centroid_pairs[i] = pack_pair(dist_l2(cvec, query), sint(i))
+
+
+# ---- step 2 : top-u clusters via secure sort ---------------------------
+
+centroid_pairs.sort()
+
+# After sorting, the first U entries are the smallest (best) cluster
+# distances.  We extract their ids; those will drive the DORAM accesses.
+probe_ids = sint.Array(U)
+for i in range(U):
+    _, probe_ids[i] = unpack_pair(centroid_pairs[i])
+
+
+# ---- step 3 : DORAM-fetch each probed bin and rank members --------------
+
+# Top-K board over all u * BIN_SIZE candidates.  We keep a sorted W of
+# size K and merge each freshly-fetched bin into it.
+W = sint.Array(K)
+for i in range(K):
+    W[i] = MAX_PAIR
+
+
+def _merge_into_W(member_pairs):
+    """Merge BIN_SIZE candidate pairs into the top-K board in place."""
+    merged = sint.Array(K + BIN_SIZE)
+    for i in range(K):
+        merged[i] = W[i]
+    for j in range(BIN_SIZE):
+        merged[K + j] = member_pairs[j]
+    merged.sort()
+    for i in range(K):
+        W[i] = merged[i]
+
+
+@for_range(U)
+def _probe(p):
+    cid = probe_ids[p]
+    # ORAM read returns (entry_tuple, freshness_bit).  We discard the bit.
+    bin_data, _ = bin_oram.access(
+        cid,
+        tuple([sint(0)] * (BIN_SIZE * D + BIN_SIZE)),
+        sint(0),
+    )
+
+    # member j: vector at offset j*D, id at offset BIN_SIZE*D + j.
+    # Slots beyond the real bin occupancy carry mid == dummy_id (which
+    # the input encoder fills with N).  We always compute the L2
+    # distance over the slot vector — its plaintext value never
+    # leaves shared form — and only override the packed rank when the
+    # slot is a dummy.  This keeps the per-bin work constant while
+    # preventing dummies from winning the top-K board.
+    member_pairs = sint.Array(BIN_SIZE)
+    dummy_const = sint(N)
+    max_dist_const = sint(MAX_DIST)
+    for j in range(BIN_SIZE):
+        vec = [bin_data[j * D + k] for k in range(D)]
+        mid = bin_data[BIN_SIZE * D + j]
+        d_real = dist_l2(vec, query)
+        is_dummy = mid == dummy_const
+        # MUX: dummy ⇒ MAX_DIST , real ⇒ d_real
+        d = d_real + is_dummy * (max_dist_const - d_real)
+        member_pairs[j] = pack_pair(d, mid)
+
+    _merge_into_W(member_pairs)
+
+
+# ---- output ------------------------------------------------------------
+
+for i in range(K):
+    d, mid = unpack_pair(W[i])
+    print_ln("rank=%s id=%s dist=%s", i, mid.reveal(), d.reveal())

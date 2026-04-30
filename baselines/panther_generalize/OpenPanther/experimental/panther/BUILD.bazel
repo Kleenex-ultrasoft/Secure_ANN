@@ -1,0 +1,378 @@
+# Copyright 2024 Ant Group Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@yacl//bazel:yacl.bzl", "AES_COPT_FLAGS")
+load("//bazel:spu.bzl", "spu_cc_binary", "spu_cc_library", "spu_cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+spu_cc_library(
+    name = "bitwidth_change",
+    srcs = ["protocol/bitwidth_adjust.cc"],
+    hdrs = ["protocol/bitwidth_adjust.h"],
+    deps = [
+        "//libspu/mpc/cheetah/nonlinear:compare_prot",
+        "//libspu/mpc/cheetah/nonlinear:truncate_prot",
+        "//libspu/mpc/cheetah/ot",
+        "@yacl//yacl/link",
+    ],
+)
+
+spu_cc_test(
+    name = "bitwidth_adjust_test",
+    srcs = ["protocol/bitwidth_adjust_test.cc"],
+    deps = [
+        ":bitwidth_change",
+        "//libspu/mpc:factory",
+        "//libspu/mpc/cheetah:state",
+        "//libspu/mpc/utils:simulate",
+    ],
+)
+
+spu_cc_test(
+    name = "dist_cmp_test",
+    srcs = ["protocol/dist_cmp_test.cc"],
+    deps = [
+        ":dist_cmp",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_test(
+    name = "dist_cmp_ss_test",
+    srcs = ["protocol/dist_cmp_ss_test.cc"],
+    deps = [
+        ":dist_cmp",
+        "//libspu/mpc/cheetah:state",
+        "//libspu/mpc/cheetah/ot",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+        "@yacl//yacl/link",
+    ],
+)
+
+spu_cc_test(
+    name = "batch_min_test",
+    srcs = ["protocol/batch_min_test.cc"],
+    deps = [
+        ":batch_min",
+        "//libspu/mpc:factory",
+        "//libspu/mpc/utils:simulate",
+    ],
+)
+
+spu_cc_library(
+    name = "batch_min",
+    srcs = ["protocol/batch_min.cc"],
+    hdrs = ["protocol/batch_min.h"],
+    deps = [
+        ":bitwidth_change",
+        "//libspu/mpc/cheetah:state",
+        "//libspu/mpc/cheetah/nonlinear:compare_prot",
+        "//libspu/mpc/cheetah/nonlinear:equal_prot",
+        "//libspu/mpc/cheetah/nonlinear:truncate_prot",
+    ],
+)
+
+spu_cc_library(
+    name = "dist_cmp",
+    srcs = ["protocol/dist_cmp.cc"],
+    hdrs = ["protocol/dist_cmp.h"],
+    deps = [
+        "//libspu/mpc/cheetah/arith:arith_comm",
+        "//libspu/mpc/cheetah/rlwe:modswitch_helper",
+        "@com_github_microsoft_seal//:seal",
+        "@yacl//yacl/utils:parallel",
+    ],
+)
+
+spu_cc_library(
+    name = "topk",
+    srcs = ["protocol/gc_topk.cc"],
+    hdrs = ["protocol/gc_topk.h"],
+    deps = [
+        "@com_github_emptoolkit_emp_sh2pc//:emp-sh2pc",
+    ],
+)
+
+spu_cc_library(
+    name = "common",
+    srcs = ["protocol/common.cc"],
+    hdrs = ["protocol/common.h"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":batch_min",
+        ":bitwidth_change",
+        ":dist_cmp",
+        ":topk",
+        "//experimental/panther/protocol/customize_pir:seal_mpir",
+        "//libspu/device:io",
+        "//libspu/mpc/cheetah:state",
+        "//libspu/psi/cryptor:sodium_curve25519_cryptor",
+        "@com_github_openssl_openssl//:openssl",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@yacl//yacl/base:buffer",
+        "@yacl//yacl/link:factory",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_client",
+    srcs = ["demo/panther_client.cc"],
+    copts = AES_COPT_FLAGS,
+    data = [
+        "dataset/sift_neighbors.txt",
+        "dataset/sift_test.txt",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_client_deep10M",
+    srcs = ["demo/panther_client_deep10M.cc"],
+    copts = AES_COPT_FLAGS,
+    data = [
+        "dataset/deep10M_neighbors.txt",
+        "dataset/deep10M_test.txt",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_server",
+    srcs = ["demo/panther_server.cc"],
+    copts = AES_COPT_FLAGS,
+    data = [
+        "dataset/sift_centroids.txt",
+        "dataset/sift_dataset.txt",
+        "dataset/sift_ptoc.txt",
+        "dataset/sift_stash.txt",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_server_deep10M",
+    srcs = ["demo/panther_server_deep10M.cc"],
+    copts = AES_COPT_FLAGS,
+    data = [
+        "dataset/deep10M_centroids.txt",
+        "dataset/deep10M_dataset.txt",
+        "dataset/deep10M_ptoc.txt",
+        "dataset/deep10M_stash.txt",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "random_panther_client",
+    srcs = [
+        "benchmark/random_panther_client.cc",
+        "benchmark/random_panther_client.h",
+    ],
+    copts = AES_COPT_FLAGS, 
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "random_panther_client_10M",
+    srcs = ["benchmark/random_panther_client_10M.cc"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "random_panther_server_10M",
+    srcs = ["benchmark/random_panther_server_10M.cc"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "random_panther_server",
+    srcs = [
+        "benchmark/random_panther_server.cc",
+        "benchmark/random_panther_server.h",
+    ],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+
+spu_cc_binary(
+    name = "random_panther_doram",
+        srcs = [
+        "benchmark/random_panther_doram.cc",
+    ],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "//libspu/mpc/aby3",
+        "//libspu/mpc/common:communicator",
+        "//libspu/kernel/hal:permute",
+        "//libspu/kernel/hal:shape_ops",
+        "//libspu/kernel/hal:type_cast",
+        "//libspu/kernel/hal:polymorphic",
+        "//libspu/kernel/hal:constants",
+        "//libspu/kernel/hal:prot_wrapper",
+        "@abseil-cpp//absl/strings",
+        "@spdlog",
+        "@yacl//yacl/link",
+        "@yacl//yacl/link:factory",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+
+spu_cc_binary(
+    name = "distance_benchmark",
+    srcs = ["benchmark/distance_benchmark.cc"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":batch_min",
+        ":bitwidth_change",
+        ":dist_cmp",
+        ":topk",
+        "//experimental/panther/protocol/customize_pir:seal_mpir",
+        "//libspu/device:io",
+        "//libspu/mpc/cheetah:state",
+        "//libspu/psi/cryptor:sodium_curve25519_cryptor",
+        "@com_github_openssl_openssl//:openssl",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@yacl//yacl/base:buffer",
+        "@yacl//yacl/link:factory",
+    ],
+)
+
+spu_cc_binary(
+    name = "topk_benchmark",
+    srcs = ["benchmark/mixed_topk_benchmark.cc"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":batch_min",
+        ":dist_cmp",
+        ":topk",
+        "//experimental/panther/protocol/customize_pir:seal_mpir",
+        "//libspu/device:io",
+        "//libspu/mpc/cheetah:state",
+        "//libspu/psi/cryptor:sodium_curve25519_cryptor",
+        "@com_github_openssl_openssl//:openssl",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@yacl//yacl/link:factory",
+    ],
+)
+
+spu_cc_binary(
+    name = "topk_test",
+    srcs = ["protocol/gc_topk_test.cc"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":topk",
+        "@com_github_openssl_openssl//:openssl",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_plain",
+    srcs = ["benchmark/panther_plain.cc"],
+    copts = AES_COPT_FLAGS,
+    data = [
+        "dataset/sift_centroids.txt",
+        "dataset/sift_dataset.txt",
+        "dataset/sift_neighbors.txt",
+        "dataset/sift_ptoc.txt",
+        "dataset/sift_stash.txt",
+        "dataset/sift_test.txt",
+    ],
+    deps = [
+        ":dist_cmp",
+    ],
+)
+
+spu_cc_binary(
+    name = "microbench_upgrade",
+    srcs = ["benchmark/microbench_upgrade.cc"],
+    copts = AES_COPT_FLAGS,
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah:cheetah",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "//libspu/mpc:factory",
+        "@com_github_microsoft_seal//:seal",
+        "//libspu/kernel/hal:permute",
+        "//libspu/kernel/hal:shape_ops",
+        "//libspu/kernel/hal:type_cast",
+        "//libspu/kernel/hal:polymorphic",
+        "//libspu/kernel/hal:constants",
+        "//libspu/kernel/hlo:indexing",
+    ],
+)

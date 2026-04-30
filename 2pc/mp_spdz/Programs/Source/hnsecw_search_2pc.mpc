@@ -1,0 +1,144 @@
+"""HNSecW oblivious base-layer search, MP-SPDZ 2PC (semi2k).
+
+Implements the same protocol as the ABY backend in 2pc/src/hnsecw/:
+fixed-T iteration bound from paper Section 4.1, fixed-size C/W arrays,
+revealed u_next per iteration with the per-layer reshuffle (paper
+Section 4.3) hiding the access pattern.
+
+Inputs (player 0):
+    - graph[N][M] (uint32)
+    - vec[N][D]   (uint8 cast to uint32)
+    - query[D]    (uint8 cast to uint32)
+
+Output: top-LW (distance, id) pairs for the query.
+
+Runtime parameters via env:
+    HNSW_N HNSW_D HNSW_M HNSW_T HNSW_LW HNSW_ENTRY (default 0)
+"""
+import os
+from Compiler.library import for_range, print_ln
+from Compiler.types import Array, Matrix, regint, sint, MemValue
+
+# semi2k optimisation: use the split-bit protocol for the
+# arithmetic-to-binary conversions inside .reveal() / sort.  Roughly
+# halves the number of online round-trips on the reveal path.
+try:
+    program.use_split(2)
+except Exception:
+    pass
+
+N = int(os.environ["HNSW_N"])
+D = int(os.environ["HNSW_D"])
+M = int(os.environ["HNSW_M"])
+T = int(os.environ["HNSW_T"])
+LW = int(os.environ["HNSW_LW"])
+ENTRY = int(os.environ.get("HNSW_ENTRY", 0))
+DUMMY_ID = N
+
+print_ln("=== HNSecW 2PC (semi2k): N=%s D=%s M=%s T=%s LW=%s ===",
+         N, D, M, T, LW)
+
+graph = Matrix(N, M, sint)
+graph.input_from(0, binary=True)
+vec = Matrix(N, D, sint)
+vec.input_from(0, binary=True)
+q = Array(D, sint)
+q.input_from(0, binary=True)
+
+INF = 1 << 30
+
+C_dist = Array(T, sint)
+C_id = Array(T, sint)
+W_dist = Array(LW, sint)
+W_id = Array(LW, sint)
+@for_range(T)
+def _(i):
+    C_dist[i] = sint(INF)
+    C_id[i] = sint(DUMMY_ID)
+@for_range(LW)
+def _(i):
+    W_dist[i] = sint(INF)
+    W_id[i] = sint(DUMMY_ID)
+
+# Visited set tracked in clear -- u_next is revealed every iteration and
+# the per-layer reshuffled tables (paper Section 4.3) hide the access
+# pattern, so a clear visited array is correctness-equivalent to and
+# strictly cheaper than an oblivious filter circuit.
+visited = Array(N + 1, regint)
+@for_range(N + 1)
+def _(i):
+    visited[i] = regint(0)
+
+u = MemValue(regint(ENTRY))
+visited[ENTRY] = regint(1)
+
+@for_range(T)
+def _iter(t):
+    nb_ids_clear = Array(M, regint)
+    nb_ids_sint = Array(M, sint)
+    @for_range(M)
+    def _(k):
+        nb_id_revealed = regint(graph[u][k].reveal())
+        is_seen = visited[nb_id_revealed]
+        final_id = (is_seen * regint(DUMMY_ID)
+                    + (regint(1) - is_seen) * nb_id_revealed)
+        nb_ids_clear[k] = final_id
+        visited[final_id] = regint(1)
+        nb_ids_sint[k] = sint(nb_id_revealed)
+
+    cand_dist = Array(M, sint)
+    @for_range(M)
+    def _(k):
+        cand_dist[k] = sint(INF)
+
+    @for_range(M)
+    def _k(k):
+        nb_id = nb_ids_clear[k]
+        @if_(nb_id < regint(N))
+        def _():
+            d = sint(0)
+            for j in range(D):
+                diff = vec[nb_id][j] - q[j]
+                d = d + diff * diff
+            cand_dist[k] = d
+
+    pairs = Matrix(T + M, 2, sint)
+    @for_range(T)
+    def _(i):
+        pairs[i][0] = C_dist[i]
+        pairs[i][1] = C_id[i]
+    @for_range(M)
+    def _(k):
+        pairs[T + k][0] = cand_dist[k]
+        pairs[T + k][1] = nb_ids_sint[k]
+    pairs.sort()
+    @for_range(T)
+    def _(i):
+        C_dist[i] = pairs[i][0]
+        C_id[i] = pairs[i][1]
+
+    w_pairs = Matrix(LW + M, 2, sint)
+    @for_range(LW)
+    def _(i):
+        w_pairs[i][0] = W_dist[i]
+        w_pairs[i][1] = W_id[i]
+    @for_range(M)
+    def _(k):
+        w_pairs[LW + k][0] = cand_dist[k]
+        w_pairs[LW + k][1] = nb_ids_sint[k]
+    w_pairs.sort()
+    @for_range(LW)
+    def _(i):
+        W_dist[i] = w_pairs[i][0]
+        W_id[i] = w_pairs[i][1]
+
+    u_reg = regint(C_id[0].reveal())
+    u.write(u_reg)
+    visited[u_reg] = regint(1)
+    C_dist[0] = sint(INF)
+    C_id[0] = sint(DUMMY_ID)
+
+print_ln("=== final W (distance, id) ===")
+@for_range(LW)
+def _(i):
+    print_ln("W[%s]=(%s,%s)", i, W_dist[i].reveal(), W_id[i].reveal())

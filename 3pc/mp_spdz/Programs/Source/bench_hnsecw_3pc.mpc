@@ -1,0 +1,48 @@
+from Compiler.library import start_timer, stop_timer, print_ln
+from Compiler.types import sint, Array
+
+# Quick micro-benchmark for replicated 3PC (ring). The goal is to
+# measure throughput of:
+#  - multiplications (proxy for distance inner products)
+#  - equality checks (proxy for visited checks)
+#  - small-n sorts (proxy for C/W updates)
+
+N_MUL = 200000
+N_EQ = N_MUL
+SORT_N1 = 128
+SORT_N2 = 64
+
+# Secret inputs (not timed).
+vec_a = sint.get_input_from(0, size=N_MUL)
+vec_b = sint.get_input_from(1, size=N_MUL)
+
+# Multiplication benchmark.
+start_timer(1)
+prod = vec_a * vec_b
+acc_mul = prod.sum()
+stop_timer(1)
+
+# Equality benchmark.
+start_timer(2)
+eq = (vec_a == vec_b)
+acc_eq = eq.sum()
+stop_timer(2)
+
+# Sort benchmark: size 128.
+arr128 = sint.Array(SORT_N1)
+arr128.assign_vector(vec_a.get_vector(0, SORT_N1))
+start_timer(3)
+arr128.sort()
+stop_timer(3)
+
+# Sort benchmark: size 64.
+arr64 = sint.Array(SORT_N2)
+arr64.assign_vector(vec_a.get_vector(0, SORT_N2))
+start_timer(4)
+arr64.sort()
+stop_timer(4)
+
+# Reveal to avoid dead-code elimination.
+print_ln("acc_mul=%s acc_eq=%s top128=%s top64=%s",
+         acc_mul.reveal(), acc_eq.reveal(), arr128[0].reveal(),
+         arr64[0].reveal())

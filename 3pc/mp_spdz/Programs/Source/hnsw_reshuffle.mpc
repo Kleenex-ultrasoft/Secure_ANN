@@ -1,0 +1,388 @@
+import json
+import math
+import os
+
+from Compiler import instructions
+from Compiler.library import for_range
+from Compiler.types import Array, Matrix, regint, sint
+
+
+cfg_path = os.environ.get("HNSW_CFG", "")
+if not cfg_path:
+    raise ValueError("HNSW_CFG is required (path to config JSON)")
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+layers = cfg["layers"]
+D = int(cfg["D"])
+key_bits = int(os.environ.get("RESHUFFLE_KEY_BITS", "64"))
+entry_count = int(os.environ.get("HNSW_ENTRY_COUNT", cfg.get("num_queries", 1)))
+join_limit = int(os.environ.get("RESHUFFLE_JOIN_LIMIT", "1048576"))
+permute_mode = os.environ.get("RESHUFFLE_PERMUTE", "secret").lower()
+if permute_mode not in ("secret", "public"):
+    raise ValueError("RESHUFFLE_PERMUTE must be 'secret' or 'public'")
+
+
+def read_shared(size):
+    if size == 0:
+        return Array(0, sint)
+    s0 = Array(size, sint)
+    s1 = Array(size, sint)
+    s2 = Array(size, sint)
+    s0.assign_vector(sint.get_input_from(0, binary=True, size=size))
+    s1.assign_vector(sint.get_input_from(1, binary=True, size=size))
+    s2.assign_vector(sint.get_input_from(2, binary=True, size=size))
+    out = Array(size, sint)
+
+    @for_range(size)
+    def _(i):
+        out[i] = s0[i] + s1[i] + s2[i]
+
+    return out
+
+
+def output_shares(vec, bits):
+    n = len(vec)
+
+    @for_range(n)
+    def _(i):
+        r0 = sint.get_random_int(bits)
+        r1 = sint.get_random_int(bits)
+        r2 = vec[i] - r0 - r1
+
+        p0 = r0.reveal_to(0)
+        regint(p0._v).binary_output(player=0)
+        p1 = r1.reveal_to(1)
+        regint(p1._v).binary_output(player=1)
+        p2 = r2.reveal_to(2)
+        regint(p2._v).binary_output(player=2)
+
+
+def stable_bit_perm(bit):
+    n = len(bit)
+    zeros = Array(n, sint)
+    ones = Array(n, sint)
+
+    @for_range(n)
+    def _(i):
+        zeros[i] = sint(1) - bit[i]
+        ones[i] = bit[i]
+
+    s0 = Array(n, sint)
+    s1 = Array(n, sint)
+    s0.assign_vector(zeros.get_vector().prefix_sum())
+    s1.assign_vector(ones.get_vector().prefix_sum())
+    total0 = s0[n - 1]
+
+    perm = Array(n, sint)
+
+    @for_range(n)
+    def _(i):
+        pos0 = s0[i] - 1
+        pos1 = total0 + s1[i] - 1
+        perm[i] = zeros[i] * pos0 + ones[i] * pos1
+
+    return perm
+
+
+def reveal_permute(perm, data, reverse=False):
+    shuffle = sint.get_secure_shuffle(len(perm))
+    perm_shuffled = perm.get_vector().secure_permute(shuffle).reveal()
+    idx = Array.create_from(perm_shuffled)
+
+    if reverse:
+        data.assign_vector(data.get_slice_vector(idx))
+        data.secure_permute(shuffle, reverse=True)
+    else:
+        data.secure_permute(shuffle)
+        v = data.get_vector()
+        data.assign_slice_vector(idx, v)
+
+    instructions.delshuffle(shuffle)
+
+
+def stable_radix_sort_multi(keys, payloads, n_bits, signed=False):
+    n = len(keys)
+    bits = Matrix.create_from(keys.get_vector().bit_decompose(n_bits))
+    if signed and len(bits) > 1:
+        bits[len(bits) - 1][:] = bits[len(bits) - 1][:].bit_not()
+
+    perm = Array.create_from(sint(regint.inc(n)))
+    num_bits = len(bits)
+
+    # Process all bits except the last one
+    @for_range(num_bits - 1)
+    def _(i):
+        bit = bits[i]
+        bit_perm = stable_bit_perm(bit)
+        reveal_permute(bit_perm, perm, reverse=False)
+        reveal_permute(perm, bits[i + 1], reverse=True)
+
+    # Process the last bit
+    if num_bits > 0:
+        bit = bits[num_bits - 1]
+        bit_perm = stable_bit_perm(bit)
+        reveal_permute(bit_perm, perm, reverse=False)
+        reveal_permute(perm, keys, reverse=True)
+        for payload in payloads:
+            reveal_permute(perm, payload, reverse=True)
+
+
+def public_permute_array(arr, perm_idx):
+    arr.assign_vector(arr.get_slice_vector(perm_idx))
+
+
+def ceil_log2(n):
+    if n <= 1:
+        return 1
+    return int(math.ceil(math.log(n, 2)))
+
+
+def flatten_matrix(mat, rows, cols):
+    out = Array(rows * cols, sint)
+
+    @for_range(rows)
+    def _(i):
+        for j in range(cols):
+            out[i * cols + j] = mat[i][j]
+
+    return out
+
+
+def extract_column(mat, rows, col_idx):
+    col = Array(rows, sint)
+
+    @for_range(rows)
+    def _(i):
+        col[i] = mat[i][col_idx]
+
+    return col
+
+
+def insert_column(mat, rows, col_idx, col):
+    @for_range(rows)
+    def _(i):
+        mat[i][col_idx] = col[i]
+
+
+def relabel_column(col, map_keys, map_vals, id_bits, join_limit):
+    n = len(col)
+    max_block = join_limit - n
+    if max_block <= 0:
+        raise ValueError("RESHUFFLE_JOIN_LIMIT too small for layer N=%s" % n)
+
+    block = max_block if max_block < n else n
+
+    for start in range(0, n, block):
+        block_len = min(block, n - start)
+        join_size = n + block_len
+        join_key = Array(join_size, sint)
+        join_tag = Array(join_size, sint)
+        join_val = Array(join_size, sint)
+        join_row = Array(join_size, sint)
+
+        @for_range(n)
+        def _(i):
+            join_key[i] = map_keys[i] * 2
+            join_tag[i] = sint(0)
+            join_val[i] = map_vals[i]
+            join_row[i] = sint(0)
+
+        @for_range(block_len)
+        def _(i):
+            idx = n + i
+            join_key[idx] = col[start + i] * 2 + 1
+            join_tag[idx] = sint(1)
+            join_val[idx] = col[start + i]
+            join_row[idx] = sint(i)
+
+        stable_radix_sort_multi(join_key, [join_tag, join_val, join_row], id_bits + 1, signed=False)
+
+        current = sint(0)
+
+        @for_range(join_size)
+        def _(i):
+            tag = join_tag[i]
+            val = join_val[i]
+            is_map = sint(1) - tag
+            current.update(is_map * val + (sint(1) - is_map) * current)
+            join_val[i] = is_map * val + (sint(1) - is_map) * current
+
+        row_bits = ceil_log2(n + 2 * block_len)
+        row_key = Array(join_size, sint)
+        row_val = Array(join_size, sint)
+
+        @for_range(join_size)
+        def _(i):
+            tag = join_tag[i]
+            row = join_row[i]
+            row_key[i] = tag * row + (sint(1) - tag) * sint(block_len + i)
+            row_val[i] = join_val[i]
+
+        stable_radix_sort_multi(row_key, [row_val], row_bits, signed=False)
+
+        @for_range(block_len)
+        def _(i):
+            col[start + i] = row_val[i]
+
+
+prev_map_keys = None
+prev_map_vals = None
+prev_id_bits = None
+
+layers_sorted = sorted(layers, key=lambda x: x["idx"])
+
+for layer in layers_sorted:
+    idx = int(layer["idx"])
+    N = int(layer["N"])
+    M = int(layer["M"])
+    id_bits = int(layer["id_bits"])
+    vec_bits = int(layer.get("vec_bits", layer.get("dist_bits", 32)))
+    x2_bits = int(layer.get("x2_bits", layer.get("dist_bits", 32)))
+    has_down = idx > 0
+    down_bits = int(layer.get("down_bits", prev_id_bits if prev_id_bits is not None else id_bits))
+
+    neigh_flat = read_shared(N * M)
+    vec_flat = read_shared(N * D)
+    x2_flat = read_shared(N)
+    dummy_flat = read_shared(N)
+    down_flat = None
+    if has_down:
+        down_flat = read_shared(N)
+
+    neigh = sint.Matrix(N, M)
+    vecs = sint.Matrix(N, D)
+    x2 = Array(N, sint)
+    is_dummy = Array(N, sint)
+    down = Array(N, sint) if has_down else None
+    old_ids = Array(N, sint)
+
+    @for_range(N)
+    def _fill_raw(i):
+        for j in range(M):
+            neigh[i][j] = neigh_flat[i * M + j]
+        for j in range(D):
+            vecs[i][j] = vec_flat[i * D + j]
+        x2[i] = x2_flat[i]
+        is_dummy[i] = dummy_flat[i]
+        if has_down:
+            down[i] = down_flat[i]
+        old_ids[i] = sint(i)
+
+    if permute_mode == "public":
+        perm_key = Array(N, sint)
+
+        @for_range(N)
+        def _init_perm(i):
+            perm_key[i] = sint.get_random_int(key_bits)
+
+        stable_radix_sort_multi(perm_key, [old_ids], key_bits, signed=False)
+
+        perm_idx = Array.create_from(old_ids.get_vector().reveal())
+
+        for j in range(M):
+            col = extract_column(neigh, N, j)
+            public_permute_array(col, perm_idx)
+            insert_column(neigh, N, j, col)
+
+        for j in range(D):
+            col = extract_column(vecs, N, j)
+            public_permute_array(col, perm_idx)
+            insert_column(vecs, N, j, col)
+
+        public_permute_array(x2, perm_idx)
+        public_permute_array(is_dummy, perm_idx)
+        if has_down:
+            public_permute_array(down, perm_idx)
+    else:
+        payload_cols = M + D + 3 + (1 if has_down else 0)
+        key_plus = payload_cols + 1
+        perm = sint.Matrix(N, key_plus)
+
+        @for_range(N)
+        def _init_perm(i):
+            perm[i][0] = sint.get_random_int(key_bits)
+            for j in range(M):
+                perm[i][1 + j] = neigh[i][j]
+            for j in range(D):
+                perm[i][1 + M + j] = vecs[i][j]
+            perm[i][1 + M + D] = x2[i]
+            perm[i][1 + M + D + 1] = is_dummy[i]
+            if has_down:
+                perm[i][1 + M + D + 2] = down[i]
+            perm[i][1 + M + D + 2 + (1 if has_down else 0)] = old_ids[i]
+
+        perm.sort(key_indices=(0,), n_bits=key_bits)
+
+        @for_range(N)
+        def _fill_perm(i):
+            for j in range(M):
+                neigh[i][j] = perm[i][1 + j]
+            for j in range(D):
+                vecs[i][j] = perm[i][1 + M + j]
+            x2[i] = perm[i][1 + M + D]
+            is_dummy[i] = perm[i][1 + M + D + 1]
+            if has_down:
+                down[i] = perm[i][1 + M + D + 2]
+            old_ids[i] = perm[i][1 + M + D + 2 + (1 if has_down else 0)]
+
+    dummy_id = sint(0)
+    seen_dummy = sint(0)
+
+    @for_range(N)
+    def _pick_dummy(i):
+        pick = is_dummy[i] * (sint(1) - seen_dummy)
+        dummy_id.update(dummy_id + pick * sint(i))
+        seen_dummy.update(seen_dummy + pick - seen_dummy * pick)
+
+    map_keys = Array(N, sint)
+    map_vals = Array(N, sint)
+
+    @for_range(N)
+    def _store_map(i):
+        map_keys[i] = old_ids[i]
+        map_vals[i] = sint(i)
+
+    stable_radix_sort_multi(map_keys, [map_vals], id_bits, signed=False)
+
+    for j in range(M):
+        col = extract_column(neigh, N, j)
+        relabel_column(col, map_keys, map_vals, id_bits, join_limit)
+        insert_column(neigh, N, j, col)
+
+    if has_down and prev_map_keys is not None:
+        relabel_column(down, prev_map_keys, prev_map_vals, down_bits, join_limit)
+
+    prev_map_keys = map_keys
+    prev_map_vals = map_vals
+    prev_id_bits = id_bits
+
+    output_shares(flatten_matrix(neigh, N, M), id_bits)
+    output_shares(flatten_matrix(vecs, N, D), vec_bits)
+    output_shares(x2, x2_bits)
+    output_shares(is_dummy, 1)
+    dummy_out = Array(1, sint)
+    dummy_out[0] = dummy_id
+    output_shares(dummy_out, id_bits)
+    if has_down:
+        output_shares(down, down_bits)
+
+entry_ids = read_shared(entry_count)
+top_n = int(layers_sorted[-1]["N"])
+entry_bits = int(layers_sorted[-1]["id_bits"])
+entry_out = Array(entry_count, sint)
+
+@for_range(entry_count)
+def _(q):
+    entry_id = entry_ids[q]
+    entry_new = sint(0)
+
+    @for_range(top_n)
+    def _map_entry(i):
+        eq = entry_id == prev_map_keys[i]
+        entry_new.update(eq * prev_map_vals[i] + (sint(1) - eq) * entry_new)
+
+    entry_out[q] = entry_new
+
+output_shares(entry_out, entry_bits)

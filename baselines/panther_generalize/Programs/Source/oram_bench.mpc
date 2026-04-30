@@ -1,0 +1,48 @@
+import math
+import os
+
+from Compiler.library import for_range, start_timer, stop_timer, print_ln
+from Compiler.types import sint
+from oram import OptimalORAM, RecursiveORAM, LinearORAM
+
+
+def ceil_log2(n):
+    if n <= 1:
+        return 1
+    return int(math.ceil(math.log(n, 2)))
+
+
+def get_oram_type(name):
+    if name == "linear":
+        return LinearORAM
+    if name == "recursive":
+        return RecursiveORAM
+    return OptimalORAM
+
+
+n = int(os.environ.get("ORAM_N", "1024"))
+entry_words = int(os.environ.get("ORAM_ENTRY_WORDS", "1"))
+word_bits = int(os.environ.get("ORAM_WORD_BITS", "32"))
+accesses = int(os.environ.get("ORAM_ACCESSES", "10"))
+impl = os.environ.get("ORAM_IMPL", "optimal").lower()
+
+oram_type = get_oram_type(impl)
+entry_size = tuple([word_bits] * entry_words)
+
+oram = oram_type(n, value_type=sint, entry_size=entry_size, init_rounds=0)
+zero_entry = tuple([sint(0)] * entry_words)
+
+@for_range(n)
+def _(i):
+    oram.write(i, zero_entry)
+
+idx_bits = ceil_log2(n)
+
+start_timer(1)
+@for_range(accesses)
+def _(i):
+    idx = sint(i % n)
+    oram.access(idx, zero_entry, sint(0))
+stop_timer(1)
+
+print_ln("ORAM_BENCH N=%s entry_words=%s accesses=%s impl=%s", n, entry_words, accesses, impl)

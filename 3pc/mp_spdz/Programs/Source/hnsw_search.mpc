@@ -1,0 +1,900 @@
+import json
+import math
+import os
+
+from Compiler.library import for_range, get_player_id, print_ln, print_ln_if
+from Compiler.types import Array, Matrix, regint, sint
+
+
+def ceil_log2(n):
+    if n <= 1:
+        return 1
+    return int(math.ceil(math.log(n, 2)))
+
+
+def read_shared(size):
+    if size == 0:
+        return Array(0, sint)
+    s0 = Array(size, sint)
+    s1 = Array(size, sint)
+    s2 = Array(size, sint)
+    s0.assign_vector(sint.get_input_from(0, binary=True, size=size))
+    s1.assign_vector(sint.get_input_from(1, binary=True, size=size))
+    s2.assign_vector(sint.get_input_from(2, binary=True, size=size))
+    out = Array(size, sint)
+
+    @for_range(size)
+    def _(i):
+        out[i] = s0[i] + s1[i] + s2[i]
+
+    return out
+
+
+cfg_path = os.environ.get("HNSW_CFG", "")
+if not cfg_path:
+    raise ValueError("HNSW_CFG is required (path to config JSON)")
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+layers = cfg["layers"]
+D = int(cfg["D"])
+num_queries = int(os.environ.get("HNSW_NUM_QUERIES", cfg.get("num_queries", 1)))
+
+mode = os.environ.get("HNSW_MODE", "single").lower()
+if mode not in ("single", "multi", "batch"):
+    raise ValueError("HNSW_MODE must be one of: single, multi, batch")
+
+output_mode = os.environ.get("HNSW_OUTPUT", "id").lower()
+output_id = output_mode in ("id", "ids", "both", "id+vec", "vec+id")
+output_vec = output_mode in ("vec", "vector", "both", "id+vec", "vec+id")
+reveal_output = os.environ.get("HNSW_REVEAL", "0") not in ("0", "", "false", "False")
+progress = os.environ.get("HNSW_PROGRESS", "0") not in ("0", "", "false", "False")
+
+# Top-K output at the base layer.  Default K=1 (paper's headline single-NN
+# search); set HNSW_TOPK to a larger value to read off the first K entries
+# from the W board (which is already sorted ascending by distance, so the
+# additional output is free of MPC cost beyond the per-id reveal).
+top_k_out = int(os.environ.get("HNSW_TOPK", "1"))
+if top_k_out < 1:
+    raise ValueError("HNSW_TOPK must be >= 1")
+
+entry_count = int(os.environ.get("HNSW_ENTRY_COUNT", "0"))
+if entry_count <= 0:
+    entry_count = 1 if mode == "single" else num_queries
+if entry_count not in (1, num_queries):
+    raise ValueError("HNSW_ENTRY_COUNT must be 1 or num_queries")
+if mode == "single" and num_queries != 1:
+    raise ValueError("single mode requires num_queries=1")
+
+
+def progress_ln(msg):
+    if progress:
+        print_ln_if(get_player_id() == 0, msg)
+
+
+def output_shares(vec, bits):
+    n = len(vec)
+
+    @for_range(n)
+    def _(i):
+        r0 = sint.get_random_int(bits)
+        r1 = sint.get_random_int(bits)
+        r2 = vec[i] - r0 - r1
+
+        p0 = r0.reveal_to(0)
+        regint(p0._v).binary_output(player=0)
+        p1 = r1.reveal_to(1)
+        regint(p1._v).binary_output(player=1)
+        p2 = r2.reveal_to(2)
+        regint(p2._v).binary_output(player=2)
+
+
+def select_row(mat, idx, row_len, n_rows):
+    out = Array(row_len, sint)
+
+    @for_range(row_len)
+    def _(j):
+        out[j] = sint(0)
+
+    @for_range(n_rows)
+    def _(i):
+        eq = idx == i
+        for j in range(row_len):
+            out[j] = eq * mat[i][j] + (sint(1) - eq) * out[j]
+
+    return out
+
+
+def select_value(arr, idx, n_rows):
+    out = sint(0)
+
+    @for_range(n_rows)
+    def _(i):
+        eq = idx == i
+        out.update(eq * arr[i] + (sint(1) - eq) * out)
+
+    return out
+
+
+def dot_product(vec, query):
+    """Squared-L2 distance ||vec - query||^2.
+
+    Despite the legacy name, HNSW's graph is built under L2, so the
+    correct distance metric used by the layer search is the squared
+    L2 between the candidate vector and the query.  Using a raw dot
+    product instead would pick the *least* similar neighbour because
+    we sort ascending and pick the smallest.  The function is left
+    named `dot_product` to keep the call sites unchanged.
+    """
+    n = len(vec)
+    if n == 0:
+        return sint(0)
+    vec_reg = sint.Array(n)
+    query_reg = sint.Array(n)
+    vec_reg.assign(vec)
+    query_reg.assign(query)
+    diffs = vec_reg[:] - query_reg[:]
+    sqs = diffs * diffs
+    return sum(sqs)
+
+
+def or_reduce_tree(bits):
+    """Tree-based OR reduction: O(log n) rounds instead of O(n)."""
+    n = len(bits)
+    if n == 0:
+        return sint(0)
+    if n == 1:
+        return bits[0]
+
+    current = list(bits)
+    while len(current) > 1:
+        half = len(current) // 2
+        left = sint.Array(half)
+        right = sint.Array(half)
+        for i in range(half):
+            left[i] = current[2 * i]
+            right[i] = current[2 * i + 1]
+        # OR: a | b = a + b - a*b
+        prods = left[:] * right[:]
+        next_bits = []
+        for i in range(half):
+            next_bits.append(left[i] + right[i] - prods[i])
+        if len(current) % 2 == 1:
+            next_bits.append(current[-1])
+        current = next_bits
+    return current[0]
+
+
+def membership(key, ids, valid, size):
+    """Check if key is in ids (where valid[i]=1), using tree-based OR."""
+    if size == 0:
+        return sint(0)
+
+    # Vectorized equality check
+    keys_arr = sint.Array(size)
+    ids_arr = sint.Array(size)
+    valid_arr = sint.Array(size)
+
+    @for_range(size)
+    def _(i):
+        keys_arr[i] = key
+        ids_arr[i] = ids[i]
+        valid_arr[i] = valid[i]
+
+    # Batch equality: (key == ids[i]) * valid[i]
+    eq_bits = (keys_arr[:] == ids_arr[:]) * valid_arr[:]
+
+    # Tree-based OR reduction
+    return or_reduce_tree(eq_bits)
+
+
+def membership_batch(keys_list, ids, valid, size):
+    """Batch membership: check each key in keys_list against ids.
+
+    Returns Array of hit flags, one per key.
+    """
+    k = len(keys_list)
+    if k == 0:
+        return Array(0, sint)
+    if size == 0:
+        out = Array(k, sint)
+        out.assign_all(sint(0))
+        return out
+
+    # Flatten: for each key, check against all ids
+    total = k * size
+    all_keys = sint.Array(total)
+    all_ids = sint.Array(total)
+    all_valid = sint.Array(total)
+
+    @for_range(k)
+    def _(i):
+        @for_range(size)
+        def _(j):
+            idx = i * size + j
+            all_keys[idx] = keys_list[i]
+            all_ids[idx] = ids[j]
+            all_valid[idx] = valid[j]
+
+    # Batch equality.  The MP-SPDZ vector form `[:] == [:]` returns a
+    # vector that does not support run-time indexing, so we copy it
+    # back into a sint Array for the OR-reduce loop below.
+    eq_vec = (all_keys[:] == all_ids[:]) * all_valid[:]
+    eq_bits = sint.Array(total)
+    eq_bits.assign_vector(eq_vec)
+
+    # OR reduce per key (use nested for_range to avoid runtime index in list comprehension)
+    out = Array(k, sint)
+    out.assign_all(sint(0))
+
+    @for_range(k)
+    def _(i):
+        @for_range(size)
+        def _(j):
+            idx = i * size + j
+            eq = eq_bits[idx]
+            out[i] = out[i] + eq - out[i] * eq  # OR operation
+
+    return out
+
+
+def cache_lookup(key, keys, vals, valid, hist_len, val_len):
+    hit = sint(0)
+    out = Array(val_len, sint)
+
+    @for_range(val_len)
+    def _(j):
+        out[j] = sint(0)
+
+    @for_range(hist_len)
+    def _(i):
+        eq = valid[i] * (keys[i] == key)
+        hit.update(hit + eq - hit * eq)
+        for j in range(val_len):
+            out[j] = eq * vals[i][j] + (sint(1) - eq) * out[j]
+
+    return hit, out
+
+
+def sort_pairs(dist_arr, id_arr):
+    n = len(dist_arr)
+    pairs = sint.Matrix(n, 2)
+
+    @for_range(n)
+    def _(i):
+        pairs[i][0] = dist_arr[i]
+        pairs[i][1] = id_arr[i]
+
+    pairs.sort(key_indices=(0,), batcher=True)
+    sorted_dist = Array.create_from(pairs.get_column(0))
+    sorted_id = Array.create_from(pairs.get_column(1))
+
+    @for_range(n)
+    def _(i):
+        dist_arr[i] = sorted_dist[i]
+        id_arr[i] = sorted_id[i]
+
+
+def merge_topk(cur_dist, cur_id, cand_dist, cand_id, keep):
+    total = keep + len(cand_dist)
+    pairs = sint.Matrix(total, 2)
+
+    @for_range(keep)
+    def _(i):
+        pairs[i][0] = cur_dist[i]
+        pairs[i][1] = cur_id[i]
+
+    @for_range(len(cand_dist))
+    def _(i):
+        pairs[keep + i][0] = cand_dist[i]
+        pairs[keep + i][1] = cand_id[i]
+
+    pairs.sort(key_indices=(0,), batcher=True)
+    sorted_dist = Array.create_from(pairs.get_column(0))
+    sorted_id = Array.create_from(pairs.get_column(1))
+
+    @for_range(keep)
+    def _(i):
+        cur_dist[i] = sorted_dist[i]
+        cur_id[i] = sorted_id[i]
+
+
+def batch_dedup(cand_ids, dummy_ids, visited_ids, visited_valid, id_bits):
+    k = len(cand_ids)
+    v = len(visited_ids)
+    total = v + k
+    sentinel = sint(1 << id_bits)
+
+    rows = sint.Matrix(total, 5)
+
+    @for_range(v)
+    def _(i):
+        vid = visited_valid[i] * visited_ids[i] + (sint(1) - visited_valid[i]) * sentinel
+        rows[i][0] = vid * 2
+        rows[i][1] = sint(0)
+        rows[i][2] = vid
+        rows[i][3] = sint(0)
+        rows[i][4] = sint(k)
+
+    @for_range(k)
+    def _(i):
+        row = v + i
+        rows[row][0] = cand_ids[i] * 2 + sint(1)
+        rows[row][1] = sint(1)
+        rows[row][2] = cand_ids[i]
+        rows[row][3] = dummy_ids[i]
+        rows[row][4] = sint(i)
+
+    rows.sort(key_indices=(0,), batcher=True)
+
+    tags = Array.create_from(rows.get_column(1))
+    ids = Array.create_from(rows.get_column(2))
+    dummies = Array.create_from(rows.get_column(3))
+    idxs = Array.create_from(rows.get_column(4))
+
+    hits = Array(total, sint)
+    id_sel = Array(total, sint)
+
+    prev = sentinel
+
+    @for_range(total)
+    def _(i):
+        eq_prev = ids[i] == prev
+        hit = tags[i] * eq_prev
+        hits[i] = hit
+        id_sel[i] = hit * dummies[i] + (sint(1) - hit) * ids[i]
+        prev.update(ids[i])
+
+    out = sint.Matrix(total, 3)
+
+    @for_range(total)
+    def _(i):
+        out_key = tags[i] * idxs[i] + (sint(1) - tags[i]) * sint(k)
+        out[i][0] = out_key
+        out[i][1] = id_sel[i]
+        out[i][2] = hits[i]
+
+    out.sort(key_indices=(0,), batcher=True)
+
+    id_prime = Array(k, sint)
+    hit_out = Array(k, sint)
+
+    @for_range(k)
+    def _(i):
+        id_prime[i] = out[i][1]
+        hit_out[i] = out[i][2]
+
+    return id_prime, hit_out
+
+
+# Load shared inputs (graph, vecs, down, dummy ids, entry ids, queries).
+graph_total = sum(int(layer["N"]) * int(layer["M"]) for layer in layers)
+vec_total = sum(int(layer["N"]) * D for layer in layers)
+down_total = sum(int(layer["N"]) for layer in layers[:-1])
+
+graph_flat = read_shared(graph_total)
+vec_flat = read_shared(vec_total)
+down_flat = read_shared(down_total)
+dummy_ids = read_shared(len(layers))
+entry_in = read_shared(entry_count)
+queries_flat = read_shared(num_queries * D)
+
+# Materialize per-layer matrices.
+graph_layers = []
+vec_layers = []
+down_layers = []
+
+graph_off = 0
+vec_off = 0
+down_off = 0
+
+for li, layer in enumerate(layers):
+    n = int(layer["N"])
+    m = int(layer["M"])
+    graph = sint.Matrix(n, m)
+    vecs = sint.Matrix(n, D)
+
+    @for_range(n)
+    def _(r):
+        for j in range(m):
+            graph[r][j] = graph_flat[graph_off + r * m + j]
+        for j in range(D):
+            vecs[r][j] = vec_flat[vec_off + r * D + j]
+
+    graph_layers.append(graph)
+    vec_layers.append(vecs)
+
+    if li < len(layers) - 1:
+        down = Array(n, sint)
+
+        @for_range(n)
+        def _(r):
+            down[r] = down_flat[down_off + r]
+
+        down_layers.append(down)
+        down_off += n
+
+    graph_off += n * m
+    vec_off += n * D
+
+queries = sint.Matrix(num_queries, D)
+
+@for_range(num_queries)
+def _(q):
+    for j in range(D):
+        queries[q][j] = queries_flat[q * D + j]
+
+entries = Array(num_queries, sint)
+
+if entry_count == 1:
+    @for_range(num_queries)
+    def _(q):
+        entries[q] = entry_in[0]
+else:
+    @for_range(num_queries)
+    def _(q):
+        entries[q] = entry_in[q]
+
+progress_ln(
+    f"[hnsw] start mode={mode} num_queries={num_queries} layers={len(layers)} entry_count={entry_count}"
+)
+
+
+# Search primitives.
+def layer_max_dist(layer):
+    val_bits = int(layer.get("vec_bits", layer.get("dist_bits", 32)))
+    inner_bits = 2 * val_bits + ceil_log2(D) + 1
+    max_key = (1 << inner_bits) - 1
+    return sint(max_key), sint(max_key - 1)
+
+
+def search_layer_single(layer_idx, entry_id, query_vec):
+    layer = layers[layer_idx]
+    n = int(layer["N"])
+    m = int(layer["M"])
+    t_steps = int(layer["T"])
+    l_c = int(layer["L_C"])
+    l_w = int(layer["L_W"])
+    dummy_id = dummy_ids[layer_idx]
+
+    max_dist, md_key = layer_max_dist(layer)
+
+    visited_len = 1 + t_steps * m
+    visited_ids = Array(visited_len, sint)
+    visited_valid = Array(visited_len, sint)
+
+    @for_range(visited_len)
+    def _(i):
+        visited_ids[i] = sint(0)
+        visited_valid[i] = sint(0)
+
+    visited_ids[0] = entry_id
+    visited_valid[0] = sint(1)
+
+    c_dist = Array(l_c, sint)
+    c_id = Array(l_c, sint)
+    w_dist = Array(l_w, sint)
+    w_id = Array(l_w, sint)
+
+    @for_range(l_c)
+    def _(i):
+        c_dist[i] = max_dist
+        c_id[i] = dummy_id
+
+    @for_range(l_w)
+    def _(i):
+        w_dist[i] = max_dist
+        w_id[i] = dummy_id
+
+    entry_vec = select_row(vec_layers[layer_idx], entry_id, D, n)
+    entry_dist = dot_product(entry_vec, query_vec)
+    c_dist[0] = entry_dist
+    c_id[0] = entry_id
+    w_dist[0] = entry_dist
+    w_id[0] = entry_id
+
+    @for_range(t_steps)
+    def _(t):
+        sort_pairs(c_dist, c_id)
+        c0_id = c_id[0]
+
+        neigh = select_row(graph_layers[layer_idx], c0_id, m, n)
+        cand_dist = Array(m, sint)
+        cand_id = Array(m, sint)
+
+        # Batch membership check for all neighbors
+        hits = membership_batch(neigh, visited_ids, visited_valid, visited_len)
+
+        for j in range(m):
+            hit = hits[j]
+            id_prime = hit * dummy_id + (sint(1) - hit) * neigh[j]
+            vec = select_row(vec_layers[layer_idx], id_prime, D, n)
+            dist = dot_product(vec, query_vec)
+            dist = hit * md_key + (sint(1) - hit) * dist
+            cand_dist[j] = dist
+            cand_id[j] = id_prime
+
+            idx = 1 + t * m + j
+            visited_ids[idx] = neigh[j]
+            visited_valid[idx] = sint(1) - hit
+
+        merge_topk(c_dist, c_id, cand_dist, cand_id, l_c)
+        merge_topk(w_dist, w_id, cand_dist, cand_id, l_w)
+
+    sort_pairs(w_dist, w_id)
+    # Return the full sorted W: caller picks w_id[0] for intermediate
+    # layers, w_id[0..K-1] for the final-layer top-K output.  No
+    # additional MPC cost beyond the trailing reveal of K-1 extra ids
+    # because the sort is already complete.
+    return w_id
+
+
+def search_layer_multi(layer_idx, entry_ids, query_mat):
+    layer = layers[layer_idx]
+    n = int(layer["N"])
+    m = int(layer["M"])
+    t_steps = int(layer["T"])
+    l_c = int(layer["L_C"])
+    l_w = int(layer["L_W"])
+    dummy_id = dummy_ids[layer_idx]
+
+    max_dist, md_key = layer_max_dist(layer)
+
+    cap_g = num_queries * t_steps
+    cap_v = num_queries * t_steps * m
+    visited_len = 1 + t_steps * m
+
+    vg_keys = Array(cap_g, sint)
+    vg_valid = Array(cap_g, sint)
+    vg_vals = sint.Matrix(cap_g, m)
+
+    vd_keys = Array(cap_v, sint)
+    vd_valid = Array(cap_v, sint)
+    vd_vals = sint.Matrix(cap_v, D)
+
+    @for_range(cap_g)
+    def _(i):
+        vg_keys[i] = sint(0)
+        vg_valid[i] = sint(0)
+        for j in range(m):
+            vg_vals[i][j] = sint(0)
+
+    @for_range(cap_v)
+    def _(i):
+        vd_keys[i] = sint(0)
+        vd_valid[i] = sint(0)
+        for j in range(D):
+            vd_vals[i][j] = sint(0)
+
+    out_w_id = sint.Matrix(num_queries, l_w)
+
+    @for_range(num_queries)
+    def _(q):
+        visited_ids = Array(visited_len, sint)
+        visited_valid = Array(visited_len, sint)
+
+        @for_range(visited_len)
+        def _(i):
+            visited_ids[i] = sint(0)
+            visited_valid[i] = sint(0)
+
+        entry_id = entry_ids[q]
+        visited_ids[0] = entry_id
+        visited_valid[0] = sint(1)
+
+        c_dist = Array(l_c, sint)
+        c_id = Array(l_c, sint)
+        w_dist = Array(l_w, sint)
+        w_id = Array(l_w, sint)
+
+        @for_range(l_c)
+        def _(i):
+            c_dist[i] = max_dist
+            c_id[i] = dummy_id
+
+        @for_range(l_w)
+        def _(i):
+            w_dist[i] = max_dist
+            w_id[i] = dummy_id
+
+        entry_vec = select_row(vec_layers[layer_idx], entry_id, D, n)
+        entry_dist = dot_product(entry_vec, query_mat[q])
+        c_dist[0] = entry_dist
+        c_id[0] = entry_id
+        w_dist[0] = entry_dist
+        w_id[0] = entry_id
+
+        @for_range(t_steps)
+        def _(t):
+            sort_pairs(c_dist, c_id)
+            c0_id = c_id[0]
+
+            hist_len_g = q * t_steps
+            hit_g, neigh_cache = cache_lookup(
+                c0_id, vg_keys, vg_vals, vg_valid, hist_len_g, m
+            )
+            id_prime_g = hit_g * dummy_id + (sint(1) - hit_g) * c0_id
+            neigh_tbl = select_row(graph_layers[layer_idx], id_prime_g, m, n)
+
+            neigh_sel = Array(m, sint)
+            for j in range(m):
+                neigh_sel[j] = hit_g * neigh_cache[j] + (sint(1) - hit_g) * neigh_tbl[j]
+
+            cand_dist = Array(m, sint)
+            cand_id = Array(m, sint)
+
+            hist_len_v = q * t_steps * m
+
+            # Batch membership check for all neighbors
+            hits = membership_batch(neigh_sel, visited_ids, visited_valid, visited_len)
+
+            for j in range(m):
+                hit = hits[j]
+                id_prime = hit * dummy_id + (sint(1) - hit) * neigh_sel[j]
+
+                hit_v, vec_cache = cache_lookup(
+                    id_prime, vd_keys, vd_vals, vd_valid, hist_len_v, D
+                )
+                id_fetch = hit_v * dummy_id + (sint(1) - hit_v) * id_prime
+                vec_tbl = select_row(vec_layers[layer_idx], id_fetch, D, n)
+
+                vec_sel = Array(D, sint)
+                for d in range(D):
+                    vec_sel[d] = hit_v * vec_cache[d] + (sint(1) - hit_v) * vec_tbl[d]
+
+                dist = dot_product(vec_sel, query_mat[q])
+                dist = hit * md_key + (sint(1) - hit) * dist
+                cand_dist[j] = dist
+                cand_id[j] = id_prime
+
+                idx = 1 + t * m + j
+                visited_ids[idx] = neigh_sel[j]
+                visited_valid[idx] = sint(1) - hit
+
+                v_idx = q * t_steps * m + t * m + j
+                vd_keys[v_idx] = id_prime
+                vd_valid[v_idx] = sint(1)
+                for d in range(D):
+                    vd_vals[v_idx][d] = vec_sel[d]
+
+            g_idx = q * t_steps + t
+            vg_keys[g_idx] = c0_id
+            vg_valid[g_idx] = sint(1)
+            for j in range(m):
+                vg_vals[g_idx][j] = neigh_sel[j]
+
+            merge_topk(c_dist, c_id, cand_dist, cand_id, l_c)
+            merge_topk(w_dist, w_id, cand_dist, cand_id, l_w)
+
+        sort_pairs(w_dist, w_id)
+        # Return the full sorted W per query — caller projects to
+        # top-1 for intermediate layers, top-K at the base layer.
+        for k in range(l_w):
+            out_w_id[q][k] = w_id[k]
+
+    return out_w_id
+
+
+def search_layer_batch(layer_idx, entry_ids, query_mat):
+    layer = layers[layer_idx]
+    n = int(layer["N"])
+    m = int(layer["M"])
+    t_steps = int(layer["T"])
+    l_c = int(layer["L_C"])
+    l_w = int(layer["L_W"])
+    dummy_id = dummy_ids[layer_idx]
+
+    max_dist, md_key = layer_max_dist(layer)
+
+    k = num_queries * m
+    visited_len = num_queries + t_steps * k
+
+    visited_ids = Array(visited_len, sint)
+    visited_valid = Array(visited_len, sint)
+
+    @for_range(visited_len)
+    def _(i):
+        visited_ids[i] = sint(0)
+        visited_valid[i] = sint(0)
+
+    @for_range(num_queries)
+    def _(q):
+        visited_ids[q] = entry_ids[q]
+        visited_valid[q] = sint(1)
+
+    c_dist = sint.Matrix(num_queries, l_c)
+    c_id = sint.Matrix(num_queries, l_c)
+    w_dist = sint.Matrix(num_queries, l_w)
+    w_id = sint.Matrix(num_queries, l_w)
+
+    @for_range(num_queries)
+    def _(q):
+        for i in range(l_c):
+            c_dist[q][i] = max_dist
+            c_id[q][i] = dummy_id
+        for i in range(l_w):
+            w_dist[q][i] = max_dist
+            w_id[q][i] = dummy_id
+        entry_vec = select_row(vec_layers[layer_idx], entry_ids[q], D, n)
+        entry_dist = dot_product(entry_vec, query_mat[q])
+        c_dist[q][0] = entry_dist
+        c_id[q][0] = entry_ids[q]
+        w_dist[q][0] = entry_dist
+        w_id[q][0] = entry_ids[q]
+
+    u = Array(num_queries, sint)
+    @for_range(num_queries)
+    def _(q):
+        u[q] = entry_ids[q]
+
+    @for_range(t_steps)
+    def _(t):
+        cand_c0 = Array(num_queries, sint)
+        dummy_c0 = Array(num_queries, sint)
+
+        @for_range(num_queries)
+        def _(q):
+            cand_c0[q] = u[q]
+            dummy_c0[q] = dummy_id
+
+        id_prime_c0, hit_c0 = batch_dedup(
+            cand_c0, dummy_c0, visited_ids, visited_valid, int(layer["id_bits"])
+        )
+
+        neigh_flat = Array(k, sint)
+
+        @for_range(num_queries)
+        def _(q):
+            neigh = select_row(graph_layers[layer_idx], id_prime_c0[q], m, n)
+            for j in range(m):
+                val = hit_c0[q] * dummy_id + (sint(1) - hit_c0[q]) * neigh[j]
+                neigh_flat[q * m + j] = val
+
+        dummy_neigh = Array(k, sint)
+        @for_range(k)
+        def _(i):
+            dummy_neigh[i] = dummy_id
+
+        id_prime_neigh, hit_neigh = batch_dedup(
+            neigh_flat, dummy_neigh, visited_ids, visited_valid, int(layer["id_bits"])
+        )
+
+        vec_tbl = sint.Matrix(k, D)
+
+        @for_range(k)
+        def _(i):
+            id_fetch = hit_neigh[i] * dummy_id + (sint(1) - hit_neigh[i]) * id_prime_neigh[i]
+            row = select_row(vec_layers[layer_idx], id_fetch, D, n)
+            for j in range(D):
+                vec_tbl[i][j] = row[j]
+
+        base = num_queries + t * k
+        @for_range(k)
+        def _(i):
+            visited_ids[base + i] = id_prime_neigh[i]
+            visited_valid[base + i] = sint(1) - hit_neigh[i]
+
+        @for_range(num_queries)
+        def _(q):
+            cand_dist = Array(k, sint)
+            cand_id = Array(k, sint)
+            for i in range(k):
+                dist = dot_product(vec_tbl[i], query_mat[q])
+                dist = hit_neigh[i] * md_key + (sint(1) - hit_neigh[i]) * dist
+                cand_dist[i] = dist
+                cand_id[i] = id_prime_neigh[i]
+
+            merge_topk(c_dist[q], c_id[q], cand_dist, cand_id, l_c)
+            merge_topk(w_dist[q], w_id[q], cand_dist, cand_id, l_w)
+            u[q] = c_id[q][0]
+
+    out_w_id = sint.Matrix(num_queries, l_w)
+
+    @for_range(num_queries)
+    def _(q):
+        sort_pairs(w_dist[q], w_id[q])
+        for k in range(l_w):
+            out_w_id[q][k] = w_id[q][k]
+
+    return out_w_id
+
+
+# Run search over layers.  Each layer's search now returns the full
+# sorted W array (size L_W per query); intermediate layers project to
+# W[0] for the next-layer entry, the final (base) layer keeps the
+# first top_k_out entries for the result output.
+current_entries = entries
+last_w_ids = None  # set on the base layer
+
+for li in range(len(layers)):
+    is_last = li == len(layers) - 1
+    if progress:
+        layer_cfg = layers[li]
+        n = int(layer_cfg["N"])
+        m = int(layer_cfg["M"])
+        t_steps = int(layer_cfg["T"])
+        l_c = int(layer_cfg["L_C"])
+        l_w = int(layer_cfg["L_W"])
+        progress_ln(
+            f"[hnsw] layer={li} start n={n} m={m} t={t_steps} l_c={l_c} l_w={l_w}"
+        )
+    if mode == "single":
+        w_id_arr = search_layer_single(li, current_entries[0], queries[0])
+        l_w_layer = int(layers[li]["L_W"])
+        if is_last:
+            last_w_ids = sint.Matrix(1, l_w_layer)
+            for k in range(l_w_layer):
+                last_w_ids[0][k] = w_id_arr[k]
+        # Next-layer entry: W[0]
+        current_entries = Array(1, sint)
+        current_entries[0] = w_id_arr[0]
+    else:
+        l_w_layer = int(layers[li]["L_W"])
+        w_id_matrix = (
+            search_layer_multi(li, current_entries, queries)
+            if mode == "multi"
+            else search_layer_batch(li, current_entries, queries)
+        )
+        if is_last:
+            last_w_ids = w_id_matrix
+        # Next-layer entry per query: W[q][0]
+        next_top = Array(num_queries, sint)
+        @for_range(num_queries)
+        def _(q):
+            next_top[q] = w_id_matrix[q][0]
+        current_entries = next_top
+
+    if not is_last:
+        down = down_layers[li]
+        next_entries = Array(num_queries, sint)
+        n = int(layers[li]["N"])
+
+        @for_range(num_queries)
+        def _(q):
+            next_entries[q] = select_value(down, current_entries[q], n)
+
+        current_entries = next_entries
+    progress_ln(f"[hnsw] layer={li} done")
+
+progress_ln("[hnsw] done")
+
+
+# Outputs.  At the base layer we keep the full sorted W board, so the
+# top-K result is just the first top_k_out entries per query.
+top_layer = layers[-1]
+out_id_bits = int(top_layer["id_bits"])
+out_vec_bits = int(top_layer.get("vec_bits", top_layer.get("dist_bits", 32)))
+l_w_base = int(top_layer["L_W"])
+k_out = min(top_k_out, l_w_base)
+
+# Flatten last_w_ids[q][0..k_out-1] into a (num_queries * k_out) array.
+top_ids = Array(num_queries * k_out, sint)
+
+@for_range(num_queries)
+def _(q):
+    for k in range(k_out):
+        top_ids[q * k_out + k] = last_w_ids[q][k]
+
+if output_id:
+    output_shares(top_ids, out_id_bits)
+
+if output_vec:
+    n = int(top_layer["N"])
+    vec_out = Array(num_queries * k_out * D, sint)
+
+    @for_range(num_queries)
+    def _(q):
+        for k in range(k_out):
+            vec = select_row(vec_layers[-1], last_w_ids[q][k], D, n)
+            for j in range(D):
+                vec_out[(q * k_out + k) * D + j] = vec[j]
+
+    output_shares(vec_out, out_vec_bits)
+
+if reveal_output:
+    @for_range(num_queries)
+    def _(q):
+        for k in range(k_out):
+            print_ln("q=%s rank=%s id=%s",
+                     q, k, last_w_ids[q][k].reveal())

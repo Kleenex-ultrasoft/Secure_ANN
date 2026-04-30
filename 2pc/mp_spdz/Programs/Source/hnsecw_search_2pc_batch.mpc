@@ -1,0 +1,154 @@
+"""HNSecW oblivious base-layer search, MP-SPDZ 2PC (semi2k), batch.
+
+Processes Q queries in lockstep within a single search loop, so the
+per-iteration circuit overhead (ABY-side: ABYParty setup;
+MP-SPDZ-side: sort circuit, reveal infrastructure) is shared across
+queries.  Each query keeps its own C / W / visited state and its own
+revealed u_next per iteration.
+
+Inputs (player 0):
+    - graph[N][M] (uint32)
+    - vec[N][D]   (uint8 cast to uint32)
+    - queries[Q][D] (uint8 cast to uint32)
+
+Output: top-LW (distance, id) per query.
+
+Runtime parameters via env: same as hnsecw_search_2pc_multi.mpc.
+"""
+import os
+from Compiler.library import for_range, print_ln
+from Compiler.types import Array, Matrix, regint, sint, MemValue
+
+# semi2k optimisation: split-bit protocol for arith-to-binary in reveal/sort.
+try:
+    program.use_split(2)
+except Exception:
+    pass
+
+
+N = int(os.environ["HNSW_N"])
+D = int(os.environ["HNSW_D"])
+M = int(os.environ["HNSW_M"])
+T = int(os.environ["HNSW_T"])
+LW = int(os.environ["HNSW_LW"])
+Q = int(os.environ["HNSW_Q"])
+ENTRY = int(os.environ.get("HNSW_ENTRY", 0))
+DUMMY_ID = N
+
+print_ln("=== HNSecW 2PC batch (semi2k): N=%s D=%s M=%s T=%s LW=%s Q=%s ===",
+         N, D, M, T, LW, Q)
+
+graph = Matrix(N, M, sint)
+graph.input_from(0, binary=True)
+vec = Matrix(N, D, sint)
+vec.input_from(0, binary=True)
+queries = Matrix(Q, D, sint)
+queries.input_from(0, binary=True)
+entries = Array(Q, sint)
+entries.input_from(0, binary=True)
+
+INF = 1 << 30
+
+C_dist = Matrix(Q, T, sint)
+C_id = Matrix(Q, T, sint)
+W_dist = Matrix(Q, LW, sint)
+W_id = Matrix(Q, LW, sint)
+
+# Per-query visited bitmap (plaintext).  Shared single-array of length
+# Q*(N+1) keeps allocation simple.
+visited = Matrix(Q, N + 1, regint)
+us = Array(Q, regint)
+
+@for_range(Q)
+def _(qi):
+    @for_range(T)
+    def _(i):
+        C_dist[qi][i] = sint(INF)
+        C_id[qi][i] = sint(DUMMY_ID)
+    @for_range(LW)
+    def _(i):
+        W_dist[qi][i] = sint(INF)
+        W_id[qi][i] = sint(DUMMY_ID)
+    @for_range(N + 1)
+    def _(i):
+        visited[qi][i] = regint(0)
+    entry_q = regint(entries[qi].reveal())
+    us[qi] = entry_q
+    visited[qi][entry_q] = regint(1)
+
+@for_range(T)
+def _iter(t):
+    @for_range(Q)
+    def _q(qi):
+        u = us[qi]
+        nb_ids_clear = Array(M, regint)
+        nb_ids_sint = Array(M, sint)
+        @for_range(M)
+        def _(k):
+            nb_id_revealed = regint(graph[u][k].reveal())
+            is_seen = visited[qi][nb_id_revealed]
+            final_id = (is_seen * regint(DUMMY_ID)
+                        + (regint(1) - is_seen) * nb_id_revealed)
+            nb_ids_clear[k] = final_id
+            visited[qi][final_id] = regint(1)
+            nb_ids_sint[k] = sint(nb_id_revealed)
+
+        cand_dist = Array(M, sint)
+        @for_range(M)
+        def _(k):
+            cand_dist[k] = sint(INF)
+        @for_range(M)
+        def _k(k):
+            nb_id = nb_ids_clear[k]
+            @if_(nb_id < regint(N))
+            def _():
+                d = sint(0)
+                for j in range(D):
+                    diff = vec[nb_id][j] - queries[qi][j]
+                    d = d + diff * diff
+                cand_dist[k] = d
+
+        pairs = Matrix(T + M, 2, sint)
+        @for_range(T)
+        def _(i):
+            pairs[i][0] = C_dist[qi][i]
+            pairs[i][1] = C_id[qi][i]
+        @for_range(M)
+        def _(k):
+            pairs[T + k][0] = cand_dist[k]
+            pairs[T + k][1] = nb_ids_sint[k]
+        pairs.sort()
+        @for_range(T)
+        def _(i):
+            C_dist[qi][i] = pairs[i][0]
+            C_id[qi][i] = pairs[i][1]
+
+        w_pairs = Matrix(LW + M, 2, sint)
+        @for_range(LW)
+        def _(i):
+            w_pairs[i][0] = W_dist[qi][i]
+            w_pairs[i][1] = W_id[qi][i]
+        @for_range(M)
+        def _(k):
+            w_pairs[LW + k][0] = cand_dist[k]
+            w_pairs[LW + k][1] = nb_ids_sint[k]
+        w_pairs.sort()
+        @for_range(LW)
+        def _(i):
+            W_dist[qi][i] = w_pairs[i][0]
+            W_id[qi][i] = w_pairs[i][1]
+
+        u_reg = regint(C_id[qi][0].reveal())
+        us[qi] = u_reg
+        visited[qi][u_reg] = regint(1)
+        C_dist[qi][0] = sint(INF)
+        C_id[qi][0] = sint(DUMMY_ID)
+
+print_ln("=== final W per query ===")
+@for_range(Q)
+def _(qi):
+    print_ln("---- q=%s ----", qi)
+    @for_range(LW)
+    def _(i):
+        print_ln("W[%s][%s]=(%s,%s)", qi, i,
+                 W_dist[qi][i].reveal(), W_id[qi][i].reveal())

@@ -1,0 +1,43 @@
+From: HNSecW <fahongzhang99@gmail.com>
+Date: 2026-05-02
+Subject: [PATCH] arith: clear m_vC on Reset()
+
+ArithSharing<T>::Reset() deletes the underlying buffers for every
+Beaver-triple component except m_vC (the multiplicative C share).
+That asymmetry was originally introduced because m_vC is partially
+populated during OT and finalized in ComputeMTsFromOTs(); the legacy
+implementation kept the previous-setup buffer alive so the OT output
+mask could be xor-merged in place.  Subsequent refactors moved that
+merge into FinishMTGeneration() but left the missing delCBitVector
+behind, so on a Reset+reuse path the next setup phase re-Creates
+m_vC[0] over a buffer that already holds the previous round's C
+values.  Verifying with -DVERIFY_ARITH_MT confirms triples become
+inconsistent (a*b != c) starting at the index where the second setup
+re-enters the buffer.
+
+The fix is one line: include m_vC[i].delCBitVector() in the same
+delCBitVector loop that already covers m_vA, m_vB, m_vS, m_vD_snd,
+m_vE_snd, m_vD_rcv, m_vE_rcv, m_vResA, m_vResB.
+
+This patch is not strictly required when the caller deletes and
+recreates the ABYParty between iterations (which is what HNSecW's
+single_b2y.cpp does, since the Reset path also has independent OT
+issues at high iteration counts), but applying it makes Reset()
+self-consistent and removes a dormant buffer-reuse bug that would
+otherwise resurface for any future caller that relies on Reset.
+
+---
+ src/abycore/sharing/arithsharing.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/abycore/sharing/arithsharing.cpp b/src/abycore/sharing/arithsharing.cpp
+--- a/src/abycore/sharing/arithsharing.cpp
++++ b/src/abycore/sharing/arithsharing.cpp
+@@ -1158,6 +1158,7 @@ void ArithSharing<T>::Reset() {
+ 	for (uint32_t i = 0; i < m_vA.size(); i++) {
+ 		m_vA[i].delCBitVector();
+ 		m_vB[i].delCBitVector();
++		m_vC[i].delCBitVector();
+ 		m_vS[i].delCBitVector();
+ 		m_vD_snd[i].delCBitVector();
+ 		m_vE_snd[i].delCBitVector();

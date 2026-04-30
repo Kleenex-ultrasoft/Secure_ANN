@@ -1,0 +1,162 @@
+import os
+
+from Compiler.library import for_range, print_ln
+from Compiler.types import Array, sint
+from Compiler import oram
+from oram import OptimalORAM, RecursiveORAM, LinearORAM
+
+
+def get_oram_type(name):
+    if name == "linear":
+        return LinearORAM
+    if name == "recursive":
+        return RecursiveORAM
+    return OptimalORAM
+
+
+# Args: N M D LC LW T ID_BITS DIST_BITS
+N = int(program.args[1])
+M = int(program.args[2])
+D = int(program.args[3])
+LC = int(program.args[4])
+LW = int(program.args[5])
+T = int(program.args[6])
+ID_BITS = int(program.args[7])
+DIST_BITS = int(program.args[8])
+SHIFT = 1 << ID_BITS
+MAX_DIST = (1 << DIST_BITS) - 1
+
+oram_impl = os.environ.get("ORAM_IMPL", "optimal")
+oram_type = get_oram_type(oram_impl)
+
+graph_entry_size = tuple([ID_BITS] * M)
+vec_entry_size = tuple([DIST_BITS] * D)
+
+graph_oram = oram_type(N, value_type=sint, entry_size=graph_entry_size, init_rounds=0)
+vec_oram = oram_type(N, value_type=sint, entry_size=vec_entry_size, init_rounds=0)
+
+def read_shared(size):
+    s0 = Array(size, sint)
+    s1 = Array(size, sint)
+    s2 = Array(size, sint)
+    s0.assign_vector(sint.get_input_from(0, binary=True, size=size))
+    s1.assign_vector(sint.get_input_from(1, binary=True, size=size))
+    s2.assign_vector(sint.get_input_from(2, binary=True, size=size))
+    out = Array(size, sint)
+
+    @for_range(size)
+    def _accum(i):
+        out[i] = s0[i] + s1[i] + s2[i]
+
+    return out
+
+
+graph_flat = read_shared(N * M)
+vec_flat = read_shared(N * D)
+dummy_id = read_shared(1)[0]
+entry_id = read_shared(1)[0]
+query = read_shared(D)
+max_pair = sint(MAX_DIST * SHIFT) + dummy_id
+
+
+@for_range(N)
+def init_graph(i):
+    row = tuple(graph_flat[i * M + j] for j in range(M))
+    graph_oram.write(i, row)
+
+
+@for_range(N)
+def init_vecs(i):
+    row = tuple(vec_flat[i * D + j] for j in range(D))
+    vec_oram.write(i, row)
+
+
+visited = sint.Array(T * M)
+visited_ptr = 0
+
+def dist_l2(vec_row):
+    acc = sint(0)
+    for j in range(D):
+        diff = vec_row[j] - query[j]
+        acc += diff * diff
+    return acc
+
+
+def pack_pair(dist, idx):
+    return dist * SHIFT + idx
+
+
+def unpack_pair(pair):
+    dist = pair >> ID_BITS
+    idx = pair - dist * SHIFT
+    return dist, idx
+
+
+# Initialize C/W with entry point
+entry_vec, _ = vec_oram.access(entry_id, tuple([sint(0)] * D), sint(0))
+entry_dist = dist_l2(entry_vec)
+
+C = sint.Array(LC)
+W = sint.Array(LW)
+for i in range(LC):
+    C[i] = max_pair
+for i in range(LW):
+    W[i] = max_pair
+
+C[0] = pack_pair(entry_dist, entry_id)
+W[0] = pack_pair(entry_dist, entry_id)
+
+
+@for_range(T)
+def search_step(t):
+    global visited_ptr
+    C.sort()
+    c0_pair = C[0]
+    _, c0_id = unpack_pair(c0_pair)
+
+    neigh, _ = graph_oram.access(c0_id, tuple([sint(0)] * M), sint(0))
+
+    new_pairs = sint.Array(M)
+
+    for j in range(M):
+        nid = neigh[j]
+        hit = sint(0)
+        for k in range(visited_ptr):
+            eq = nid == visited[k]
+            hit = hit + eq - hit * eq
+        nid_prime = nid + hit * (dummy_id - nid)
+
+        vec, _ = vec_oram.access(nid_prime, tuple([sint(0)] * D), sint(0))
+        dist = dist_l2(vec)
+        dist = dist + hit * (sint(MAX_DIST) - dist)
+        new_pairs[j] = pack_pair(dist, nid_prime)
+
+        if visited_ptr < T * M:
+            visited[visited_ptr] = nid
+            visited_ptr += 1
+
+    # Update C
+    merged_c = sint.Array(LC + M)
+    for i in range(LC):
+        merged_c[i] = C[i]
+    for j in range(M):
+        merged_c[LC + j] = new_pairs[j]
+    merged_c.sort()
+    for i in range(LC):
+        C[i] = merged_c[i]
+
+    # Update W
+    merged_w = sint.Array(LW + M)
+    for i in range(LW):
+        merged_w[i] = W[i]
+    for j in range(M):
+        merged_w[LW + j] = new_pairs[j]
+    merged_w.sort()
+    for i in range(LW):
+        W[i] = merged_w[i]
+
+
+if L_W > 1:
+    W.sort()
+best_dist, best_id = unpack_pair(W[0])
+print_ln("best_id=%s best_dist=%s", best_id.reveal(), best_dist.reveal())

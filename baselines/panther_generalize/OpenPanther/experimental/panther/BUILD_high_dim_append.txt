@@ -1,0 +1,76 @@
+spu_cc_binary(
+    name = "panther_client_1536",
+    srcs = [
+        "demo/panther_client_generic.cc",
+        "dataset/random-1536-euclidean/random-1536-euclidean_params.h",
+    ],
+    copts = AES_COPT_FLAGS + [
+        "-Iexperimental/panther",
+        "-DPARAM_HEADER=\\\"dataset/random-1536-euclidean/random-1536-euclidean_params.h\\\"",
+        "-DDATASET_NAME=\\\"random-1536-euclidean\\\"",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_server_1536",
+    srcs = [
+        "demo/panther_server_generic.cc",
+        "dataset/random-1536-euclidean/random-1536-euclidean_params.h",
+    ],
+    copts = AES_COPT_FLAGS + [
+        "-Iexperimental/panther",
+        "-DPARAM_HEADER=\\\"dataset/random-1536-euclidean/random-1536-euclidean_params.h\\\"",
+        "-DDATASET_NAME=\\\"random-1536-euclidean\\\"",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_client_3072",
+    srcs = [
+        "demo/panther_client_generic.cc",
+        "dataset/random-3072-euclidean/random-3072-euclidean_params.h",
+    ],
+    copts = AES_COPT_FLAGS + [
+        "-Iexperimental/panther",
+        "-DPARAM_HEADER=\\\"dataset/random-3072-euclidean/random-3072-euclidean_params.h\\\"",
+        "-DDATASET_NAME=\\\"random-3072-euclidean\\\"",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+
+spu_cc_binary(
+    name = "panther_server_3072",
+    srcs = [
+        "demo/panther_server_generic.cc",
+        "dataset/random-3072-euclidean/random-3072-euclidean_params.h",
+    ],
+    copts = AES_COPT_FLAGS + [
+        "-Iexperimental/panther",
+        "-DPARAM_HEADER=\\\"dataset/random-3072-euclidean/random-3072-euclidean_params.h\\\"",
+        "-DDATASET_NAME=\\\"random-3072-euclidean\\\"",
+    ],
+    deps = [
+        ":common",
+        "//libspu/mpc/cheetah/rlwe:lwe",
+        "//libspu/mpc/utils:simulate",
+        "@com_github_microsoft_seal//:seal",
+    ],
+)
+

@@ -1,0 +1,232 @@
+import json
+import math
+import os
+
+from Compiler import instructions
+from Compiler.library import for_range, print_ln
+from Compiler.types import Array, Matrix, regint, sint
+from oram import OptimalORAM, RecursiveORAM, LinearORAM
+
+
+def ceil_log2(n):
+    if n <= 1:
+        return 1
+    return int(math.ceil(math.log(n, 2)))
+
+
+def read_shared(size):
+    if size == 0:
+        return Array(0, sint)
+    s0 = Array(size, sint)
+    s1 = Array(size, sint)
+    s2 = Array(size, sint)
+    s0.assign_vector(sint.get_input_from(0, binary=True, size=size))
+    s1.assign_vector(sint.get_input_from(1, binary=True, size=size))
+    s2.assign_vector(sint.get_input_from(2, binary=True, size=size))
+    out = Array(size, sint)
+
+    @for_range(size)
+    def _(i):
+        out[i] = s0[i] + s1[i] + s2[i]
+
+    return out
+
+
+def output_shares(vec, bits):
+    n = len(vec)
+
+    @for_range(n)
+    def _(i):
+        r0 = sint.get_random_int(bits)
+        r1 = sint.get_random_int(bits)
+        r2 = vec[i] - r0 - r1
+
+        p0 = r0.reveal_to(0)
+        regint(p0._v).binary_output(player=0)
+        p1 = r1.reveal_to(1)
+        regint(p1._v).binary_output(player=1)
+        p2 = r2.reveal_to(2)
+        regint(p2._v).binary_output(player=2)
+
+
+def stable_bit_perm(bit):
+    """Stable permutation for a single secret bit (0/1).
+
+    This matches the Three-Party-Sorting construction: prefix sums of
+    f0=1-b and f1=b, then map zeros before ones while preserving order.
+    """
+    n = len(bit)
+    zeros = Array(n, sint)
+    ones = Array(n, sint)
+
+    @for_range(n)
+    def _(i):
+        zeros[i] = sint(1) - bit[i]
+        ones[i] = bit[i]
+
+    s0 = Array(n, sint)
+    s1 = Array(n, sint)
+    s0.assign_vector(zeros.get_vector().prefix_sum())
+    s1.assign_vector(ones.get_vector().prefix_sum())
+    total0 = s0[n - 1]
+
+    perm = Array(n, sint)
+    @for_range(n)
+    def _(i):
+        pos0 = s0[i] - 1
+        pos1 = total0 + s1[i] - 1
+        perm[i] = zeros[i] * pos0 + ones[i] * pos1
+
+    return perm
+
+
+def reveal_permute(perm, data, reverse=False):
+    """Shuffle-and-reveal application of a secret permutation."""
+    shuffle = sint.get_secure_shuffle(len(perm))
+    perm_shuffled = perm.get_vector().secure_permute(shuffle).reveal()
+    idx = Array.create_from(perm_shuffled)
+
+    if reverse:
+        data.assign_vector(data.get_slice_vector(idx))
+        data.secure_permute(shuffle, reverse=True)
+    else:
+        data.secure_permute(shuffle)
+        v = data.get_vector()
+        data.assign_slice_vector(idx, v)
+
+    instructions.delshuffle(shuffle)
+
+
+def stable_radix_sort(keys, payload, n_bits, signed=True):
+    """Stable radix sort using shuffle-based permutation composition."""
+    n = len(keys)
+    bits = Matrix.create_from(keys.get_vector().bit_decompose(n_bits))
+    if signed and len(bits) > 1:
+        bits[len(bits) - 1][:] = bits[len(bits) - 1][:].bit_not()
+
+    perm = Array.create_from(sint(regint.inc(n)))
+
+    for i in range(len(bits)):
+        bit = bits[i]
+        bit_perm = stable_bit_perm(bit)
+        reveal_permute(bit_perm, perm, reverse=False)
+        if i < len(bits) - 1:
+            reveal_permute(perm, bits[i + 1], reverse=True)
+        else:
+            reveal_permute(perm, keys, reverse=True)
+            reveal_permute(perm, payload, reverse=True)
+
+
+def get_oram_type(name):
+    if name == "linear":
+        return LinearORAM
+    if name == "recursive":
+        return RecursiveORAM
+    return OptimalORAM
+
+
+cfg_path = os.environ.get("SORT_CFG", "")
+if not cfg_path:
+    raise ValueError("SORT_CFG is required (path to config JSON)")
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+n = int(cfg["N"])
+D = int(cfg["D"])
+num_queries = int(os.environ.get("SORT_NUM_QUERIES", cfg.get("num_queries", 1)))
+k = int(cfg.get("k", 1))
+vec_bits = int(cfg.get("vec_bits", cfg.get("dist_bits", 32)))
+id_bits = int(cfg.get("id_bits", ceil_log2(n)))
+
+if n <= 0 or D <= 0:
+    raise ValueError("SORT expects N>0 and D>0")
+if num_queries <= 0:
+    raise ValueError("SORT expects num_queries>0")
+if k <= 0 or k > n:
+    raise ValueError("SORT expects 1 <= k <= N")
+
+output_mode = os.environ.get("SORT_OUTPUT", "id").lower()
+output_id = output_mode in ("id", "ids", "both", "id+vec", "vec+id")
+output_vec = output_mode in ("vec", "vector", "both", "id+vec", "vec+id")
+reveal_output = os.environ.get("SORT_REVEAL", "0") not in ("0", "", "false", "False")
+
+oram_impl = os.environ.get("SORT_ORAM_IMPL", "optimal").lower()
+
+inner_bits = 2 * vec_bits + ceil_log2(D) + 1
+
+vec_flat = read_shared(n * D)
+queries_flat = read_shared(num_queries * D)
+
+vecs = sint.Matrix(n, D)
+
+@for_range(n)
+def _(i):
+    for j in range(D):
+        vecs[i][j] = vec_flat[i * D + j]
+
+queries = sint.Matrix(num_queries, D)
+
+@for_range(num_queries)
+def _(q):
+    for j in range(D):
+        queries[q][j] = queries_flat[q * D + j]
+
+# Initialize ORAM for DORAM top-k fetch.
+oram_type = get_oram_type(oram_impl)
+entry_size = tuple([vec_bits] * D)
+oram = oram_type(n, value_type=sint, entry_size=entry_size, init_rounds=0)
+
+@for_range(n)
+def _(i):
+    row = tuple(vecs[i][j] for j in range(D))
+    oram.write(i, row)
+
+zero_entry = tuple([sint(0)] * D)
+
+# Outputs
+out_ids = Array(num_queries * k, sint) if output_id else None
+out_vecs = Array(num_queries * k * D, sint) if output_vec else None
+
+@for_range(num_queries)
+def _(q):
+    dist = Array(n, sint)
+    ids = Array(n, sint)
+
+    @for_range(n)
+    def _(i):
+        acc = sint(0)
+        for j in range(D):
+            acc += vecs[i][j] * queries[q][j]
+        dist[i] = acc
+        ids[i] = sint(i)
+    pairs = Matrix(n, 2, sint)
+    @for_range(n)
+    def _(i):
+        pairs[i][0] = dist[i]
+        pairs[i][1] = ids[i]
+    pairs.sort()
+    @for_range(n)
+    def _(i):
+        dist[i] = pairs[i][0]
+        ids[i] = pairs[i][1]
+
+    @for_range(k)
+    def _(i):
+        idx = ids[i]
+        if output_id:
+            out_ids[q * k + i] = idx
+        if output_vec:
+            vec, _ = oram.access(idx, zero_entry, sint(0))
+            for j in range(D):
+                out_vecs[(q * k + i) * D + j] = vec[j]
+
+if output_id:
+    output_shares(out_ids, id_bits)
+if output_vec:
+    output_shares(out_vecs, vec_bits)
+
+if reveal_output and output_id:
+    @for_range(num_queries)
+    def _(q):
+        print_ln("q=%s top1=%s", q, out_ids[q * k].reveal())

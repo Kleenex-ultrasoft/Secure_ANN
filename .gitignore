@@ -1,0 +1,18 @@
+# Logs and run artifacts
+mpc_logs_*/
+reshuffle_logs/
+logs/
+*.log
+
+# Generated MPC inputs/outputs
+Player-Data/
+Binary-Output-P*
+Input-Binary-P*
+Input-P*
+Output-P*
+*.bc
+*.sch
+
+# Python cache
+__pycache__/
+*.pyc

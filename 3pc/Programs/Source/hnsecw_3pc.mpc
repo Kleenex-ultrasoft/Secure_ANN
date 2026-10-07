@@ -1,0 +1,1635 @@
+"""HNSecW layer search, three parties, replicated secret sharing over Z_2^64
+(MP-SPDZ, replicated-ring-party.x).  Compile with  -M -E ring -R 64.
+
+One run searches one HNSW layer for Q queries.
+
+    MODE=single   independent searches, one after another (Algorithm 2).
+                  Every query has its own visited list, so every query needs
+                  its own shuffled copy of the tables.
+    MODE=multi    the queries are searched one after another on ONE shuffled
+                  copy.  The visited lists are shared by all queries, so no
+                  table address is opened twice (see "Several queries").
+    MODE=batch    the queries advance together on one shuffled copy and
+                  share the visited lists (Algorithm 4).
+
+Compile-time parameters (environment):
+
+    HNSW_N       real nodes of the layer (table rows 0..N-1)
+    HNSW_M       degree bound
+    HNSW_D       dimension
+    HNSW_T       iterations (ef + Delta), at least 2
+    HNSW_EF      size of the result array W
+    HNSW_BITS    bits per address (must cover N plus the dummy pool)
+    HNSW_Q       number of queries (default 1)
+    HNSW_MODE    single | multi | batch (default single)
+    HNSW_VBITS   bits per coordinate (default 8)
+    HNSW_DIGIT   largest stored address digit in bits (default 8, see below)
+    HNSW_CHECK   dense | sparse visited check (default: chosen by cost)
+    HNSW_PREPARE 0 turns off prepared comparisons (default 1)
+    HNSW_FUSED   0 uses standard instructions only (default 1 with the
+                 build of scripts/build_mpspdz.sh)
+    HNSW_SELECT  pairs | pivots | P,S: how the merge of an iteration chooses
+                 the rows to compare (default: pairs in single and multi
+                 mode, pivots in batch mode; P,S fixes the number of pivots
+                 and the shortlist length)
+
+Inputs, all from party 0 as binary int64 (bench/gen_inputs.py writes them):
+
+    graph        (N+1) x (GCOLS*M)   neighbour addresses, digit by digit
+    vectors      (N+1) x D
+    norms        (N+1)               squared norm of every vector
+    queries      Q x D
+    entries      Q                   entry points
+
+A neighbour address is stored as digits, and every digit as its one-hot
+encoding (2^w shared bits for a digit of w bits; a one-bit digit as the bit
+itself).  The visited check needs the one-hot encoding of the two halves of
+an address.  Each half is cut into the fewest digits of at most HNSW_DIGIT
+bits: with the default of 8, a half of up to 8 bits is stored ready to use
+and a longer one takes one round of AND gates.  The price is a wider graph
+table (128 instead of 20 shared bits for a 20-bit address, 768 instead of
+30 for a 30-bit address).  A smaller HNSW_DIGIT gives narrower tables and
+one or two more rounds per iteration; HNSW_DIGIT=1 stores plain address
+bits.
+
+Row N of the tables is the row every dummy address maps to: its neighbour
+slots hold sigma, its vector is zero and its norm entry is 2^DIST_BITS, so
+that a dummy scores worse than every real vector without any further work.
+The neighbours of a node must be distinct; unused slots hold sigma.
+
+What is opened: the addresses of the table rows that are read (each address
+at most once per table), the outcomes of comparisons between rows of a
+freshly shuffled array, and the result addresses.  Two of the parties also
+see the keys of such rows plus uniformly random masks that neither of them
+knows.  Everything else stays secret-shared.
+
+Timer 1 covers the search.  Timer 2 covers the preparation of the
+comparisons (see Dealt), which depends neither on the query nor on the
+tables.
+"""
+import math
+import os
+
+from Compiler import comparison
+from Compiler import instructions as arithmetic_instructions
+from Compiler.GC import instructions as binary_instructions
+from Compiler.GC.types import cbits, sbits
+from Compiler.library import (break_point, crash, do_while, else_, for_range, function_block, if_e,
+                              print_ln, start_timer, stop_timer)
+from Compiler.types import Array, Matrix, MemValue, cint, regint, sint
+
+N = int(os.environ["HNSW_N"])
+M = int(os.environ["HNSW_M"])
+D = int(os.environ["HNSW_D"])
+T = int(os.environ["HNSW_T"])
+EF = int(os.environ["HNSW_EF"])
+B = int(os.environ["HNSW_BITS"])
+Q = int(os.environ.get("HNSW_Q", "1"))
+MODE = os.environ.get("HNSW_MODE", "single")
+VBITS = int(os.environ.get("HNSW_VBITS", "8"))
+DIGIT = int(os.environ.get("HNSW_DIGIT", "8"))
+assert MODE in ("single", "multi", "batch")
+assert 1 <= EF <= T and T >= 2
+assert M >= 2 and B >= 4 and 1 <= DIGIT <= 8
+
+BATCH = MODE == "batch"
+MULTI = MODE == "multi"
+# Comparisons from prepared material (see Sorter.prepare).
+PREPARE = os.environ.get("HNSW_PREPARE", "1") != "0"
+# Instructions of the build of scripts/build_mpspdz.sh.  They save rounds
+# (the product of two shared bits is opened without sharing it first; a
+# shuffle takes two rounds and opens masked keys on the way), let one party
+# prepare the comparisons, and run loops over binary memory natively.
+FUSED = (os.environ.get("HNSW_FUSED", "1") != "0"
+         and hasattr(binary_instructions, "revealsum")
+         and hasattr(binary_instructions, "xormemb")
+         and hasattr(arithmetic_instructions, "shuffleopen")
+         and hasattr(arithmetic_instructions, "cmpopen"))
+SHARED = BATCH or MULTI          # one visited list for all queries
+assert not BATCH or Q >= 2, "batch mode needs at least two queries"
+U = Q if BATCH else 1            # queries advanced together
+K = U * M                        # vector rows fetched per iteration
+GL = max(U, 2)                   # lanes of the graph check (one is padding if U = 1)
+
+# Address space: [0, N) real rows, then dummies, then sentinels, then sigma.
+#   vector dummies   VEC_DUM + step*K + k     replaces neighbour k of a step
+#   graph dummies    GRAPH_DUM + step*GL + u  replaces the head of query u
+# A step is an iteration; in multi mode every query has one more step at its
+# start, which looks up its entry point.  Batch mode also has U dummies for
+# repeated entry points.
+VEC_STEPS = Q * (T + 1) if MULTI else T
+GRAPH_STEPS = (Q * T if MULTI else T) if SHARED else 0
+VEC_DUM = N + (U if BATCH else 0)
+GRAPH_DUM = VEC_DUM + VEC_STEPS * K
+C_SENT = GRAPH_DUM + GRAPH_STEPS * GL            # + r, r < T
+SIGMA = C_SENT + T
+assert SIGMA < 2 ** B, "HNSW_BITS too small for N plus the dummy pool"
+
+# A row is ordered by  distkey * 2^tie_bits + position, where
+#   distkey  = squared distance, plus 2^DIST_BITS for a dummy (see above)
+#   position = index of the row in the array that is being sorted.
+# Positions make the keys of an array distinct, so the comparison outcomes
+# of a shuffled array are those of a uniformly random permutation.
+DIST_BITS = 2 * VBITS + max(1, math.ceil(math.log2(D)))      # distances are < 2^DIST_BITS
+SENT_KEY = 2 ** (DIST_BITS + 1) - 1
+
+# Row layout: full key, distkey, b (result address), a (graph address).
+# With shared visited lists a is kept bit by bit, because the heads are
+# checked before they are opened.  With several queries per array a last
+# column holds the query index.
+A_COL = 3
+A_COLS = B if SHARED else 1
+W = A_COL + A_COLS + (1 if U > 1 else 0)
+
+def digit_widths(digit):
+    """Digits of an address, least significant first: the low half of the
+    bits and the high half are each cut into the fewest digits of at most
+    `digit` bits, as evenly as possible.  Returns (widths, number of low
+    digits)."""
+    def cut(bits):
+        n = -(-bits // digit)
+        return [bits // n + 1] * (bits % n) + [bits // n] * (n - bits % n)
+
+    low, high = cut((B + 1) // 2), cut(B // 2)
+    return low + high, len(low)
+
+
+STORED = digit_widths(DIGIT)             # digits of a stored neighbour address
+BITWISE = digit_widths(1)                # an address given bit by bit
+
+
+def columns(widths):
+    return sum(1 if w == 1 else 2 ** w for w in widths)
+
+
+GCOLS = columns(STORED[0])
+
+print_ln("=== HNSecW 3PC %s: N=%s M=%s D=%s T=%s ef=%s Q=%s address bits=%s ===",
+         MODE, N, M, D, T, EF, Q, B)
+
+# ---------------------------------------------------------------------------
+# Tables (secret-shared; the harness inputs them from party 0)
+# ---------------------------------------------------------------------------
+
+graph = Matrix(N + 1, GCOLS * M, sint)
+graph.input_from(0, binary=True)
+vec = Matrix(N + 1, D, sint)
+vec.input_from(0, binary=True)
+norm = Array(N + 1, sint)
+norm.input_from(0, binary=True)
+queries = Matrix(Q, D, sint)
+queries.input_from(0, binary=True)
+entries_in = Array(Q, sint)
+entries_in.input_from(0, binary=True)
+entries = Array(Q, regint)
+entries.assign_vector(regint(entries_in.get_vector().reveal()))
+
+_waited = MemValue(cint(0))
+
+
+def wait_for_all():
+    """Every party waits until the others have got here.  A party that only
+    sends (the tables above, prepared material) is otherwise ahead of the
+    others, and its timers would count their catching up as search time."""
+    for _ in range(2):
+        _waited.write(_waited.read() + sint(0).reveal())
+        break_point()
+
+
+wait_for_all()
+
+
+def rows_of(addr):
+    """Table rows of public addresses: dummies and sigma share row N."""
+    real = addr < N
+    return real * addr + (1 - real) * N
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def repeat(vector, times):
+    """(x0, x1, ...) -> (x0 .. x0, x1 .. x1, ...), each `times` times."""
+    if times == 1:
+        return vector
+    n = len(vector)
+    tmp = Array(n, type(vector))
+    tmp.assign_vector(vector)
+    return type(vector).load_mem(regint.inc(n * times, tmp.address, 1, times))
+
+
+def fetch_rows(table, rows):
+    """The rows of a secret table at public indices (a regint vector), as
+    one row-major vector."""
+    width = table.sizes[1]
+    address = table.address + rows * width
+    return sint.concat([sint.load_mem(address[i], size=width) for i in range(len(rows))])
+
+
+def lanes(bit_vector):
+    """Arithmetic shares of bits (a sint vector) -> one binary register with
+    one lane per element.  The least significant bit of a sum is the XOR of
+    the least significant bits of the summands, so the conversion is local."""
+    cols = bit_vector.split_to_n_summands(1, 3)
+    return cols[0][0] ^ cols[0][1] ^ cols[0][2]
+
+
+def bit_of(addr_vector, j):
+    return (addr_vector >> j) - ((addr_vector >> (j + 1)) << 1)
+
+
+def public_bits(addr_vector):
+    """Binary registers for the bits of public addresses (a regint vector)."""
+    return [lanes(sint(bit_of(addr_vector, j))) for j in range(B)]
+
+
+def public_digits(addr_vector, widths):
+    """One-hot digits of public addresses, in the layout of the graph table."""
+    out = []
+    offset = 0
+    for w in widths:
+        if w == 1:
+            bit = lanes(sint(bit_of(addr_vector, offset)))
+            out.append([~bit, bit])
+        else:
+            digit = (addr_vector >> offset) - ((addr_vector >> (offset + w)) << w)
+            out.append([lanes(sint(digit == v)) for v in range(2 ** w)])
+        offset += w
+    return out
+
+
+def stored_digits(fetched, rows):
+    """One-hot digits of the neighbours in `rows` fetched graph rows, as
+    registers with rows*M lanes (lane r*M + k is neighbour k of row r)."""
+    def column(c):
+        parts = [fetched.get_vector(r * GCOLS * M + c * M, M) for r in rows]
+        return lanes(parts[0] if len(parts) == 1 else sint.concat(parts))
+
+    out = []
+    c = 0
+    for w in STORED[0]:
+        if w == 1:
+            bit = column(c)
+            out.append([~bit, bit])
+            c += 1
+        else:
+            out.append([column(c + v) for v in range(2 ** w)])
+            c += 2 ** w
+    return out
+
+
+def bits_of(digits, widths):
+    """Address bits from one-hot digits (local)."""
+    out = []
+    for regs, w in zip(digits, widths):
+        if w == 1:
+            out.append(regs[1])
+        else:
+            for j in range(w):
+                out.append(xor_all(regs[v] for v in range(2 ** w) if (v >> j) & 1))
+    return out
+
+
+def local_and(a, b):
+    """a AND b as an additive sharing (one summand per party), without
+    communication.  The result may only be XORed, ANDed with clear bits and
+    opened with open_sum."""
+    res = sbits.get_type(a.n)()
+    binary_instructions.localand(a.n, res, a, b)
+    return res
+
+
+def open_sum(x):
+    """Opens a register built from local_and results and ordinary shares."""
+    res = cbits.get_type(x.n)()
+    binary_instructions.revealsum(x.n, res, x)
+    return res
+
+
+def open_and_xor(a, b, c):
+    """Opens (a AND b) XOR c; one round if FUSED."""
+    if FUSED:
+        return open_sum(local_and(a, b) ^ c)
+    return ((a & b) ^ c).reveal()
+
+
+def bit_sums(terms):
+    """terms[v], v < 2^w.  Returns ([XOR of the terms whose index has bit j
+    set, for j < w], XOR of all terms), with about 2 * 2^w XORs."""
+    w = len(terms).bit_length() - 1
+    assert len(terms) == 2 ** w
+    out = [None] * w
+    for j in reversed(range(w)):
+        half = len(terms) // 2
+        out[j] = xor_all(terms[half:])
+        terms = [terms[v] ^ terms[v + half] for v in range(half)]
+    return out, terms[0]
+
+
+def clear_planes(addr_vector):
+    """Clear bit registers for the bits of public addresses."""
+    return sbits.bit_decompose_clear(cint(addr_vector), B)
+
+
+# Loops over binary memory.  `index` arrays are regint Arrays.
+
+def identity(size):
+    """A regint Array holding 0, 1, 2, ..."""
+    array = Array(size, regint)
+    array.assign_vector(regint.inc(size))
+    return array
+
+
+def xor_into(dest, dest_index, source, source_index, count):
+    """dest[dest_index[i]] ^= source[source_index[i]] for i < count."""
+    if FUSED:
+        break_point()
+        binary_instructions.xormemb(
+            dest.value_type.n, regint(dest.address), regint(dest_index.address),
+            regint(source.address), regint(source_index.address), regint.conv(count), 0)
+        break_point()
+    else:
+        @for_range(count)
+        def _(i):
+            k = dest_index[i]
+            dest[k] = dest[k] ^ source[source_index[i]]
+
+
+def xor_products_into(dest, dest_index, a, a_index, b, b_index, count):
+    """dest[dest_index[i]] ^= local_and(a[a_index[i]], b[b_index[i]]) for
+    i < count (FUSED only)."""
+    break_point()
+    binary_instructions.xorandmemb(
+        dest.value_type.n, regint(dest.address), regint(dest_index.address),
+        regint(a.address), regint(a_index.address), regint(b.address), regint(b_index.address),
+        regint.conv(count))
+    break_point()
+
+
+def and_entries(*groups):
+    """For every group (dest, a, a_index, b, b_index, count):
+    dest[i] = a[a_index[i]] & b[b_index[i]] for i < count.  One round."""
+    args = []
+    for dest, a, a_index, b, b_index, count in groups:
+        args += [dest.value_type.n, regint(dest.address), regint(a.address), regint(a_index.address),
+                 regint(b.address), regint(b_index.address), regint.conv(count)]
+    break_point()
+    binary_instructions.andmemb(*args)
+    break_point()
+
+
+def clear_cells(array, everyone, size=None):
+    """array[i] = 0 for i < size.  everyone: see identity."""
+    size = len(array) if size is None else size
+    if FUSED:
+        xor_into(array, everyone, array, everyone, size)
+    else:
+        @for_range(size)
+        def _(i):
+            array[i] = array.value_type(0)
+
+
+def store_registers(array, registers):
+    """array[i] = registers[i].  The compiler orders memory writes pairwise
+    within a basic block, so a long run of writes is cut into several blocks."""
+    for i, r in enumerate(registers):
+        if i % 64 == 0:
+            break_point()
+        array[i] = r
+    break_point()
+
+
+def and_tree(items):
+    items = list(items)
+    while len(items) > 1:
+        nxt = [items[i] & items[i + 1] for i in range(0, len(items) - 1, 2)]
+        if len(items) % 2:
+            nxt.append(items[-1])
+        items = nxt
+    return items[0]
+
+
+def or_tree(items):
+    return ~and_tree([~x for x in items])
+
+
+def xor_all(items):
+    items = list(items)
+    acc = items[0]
+    for x in items[1:]:
+        acc = acc ^ x
+    return acc
+
+
+def join(tables):
+    """tables: one-hot encodings (lists of registers) of consecutive digits,
+    least significant first.  Returns the one-hot encoding of the combined
+    value: register v is 1 in the lanes whose value equals v.
+
+    Balanced tree of product tables.  In each table the last row and column
+    follow from the fact that a row sums to its high term and a column to its
+    low term, so a table of a x b terms costs (a - 1)(b - 1) AND gates."""
+    if len(tables) == 1:
+        return tables[0]
+    half = len(tables) // 2
+    low = join(tables[:half])
+    high = join(tables[half:])
+    nl, nh = len(low), len(high)
+    out = [None] * (nl * nh)
+    col = [None] * nl
+    for h in range(nh - 1):
+        acc = None
+        for l in range(nl - 1):
+            w = low[l] & high[h]
+            out[h * nl + l] = w
+            acc = w if acc is None else acc ^ w
+        out[h * nl + nl - 1] = high[h] ^ acc
+        for l in range(nl):
+            w = out[h * nl + l]
+            col[l] = w if col[l] is None else col[l] ^ w
+    for l in range(nl):
+        out[(nh - 1) * nl + l] = low[l] ^ col[l]
+    return out
+
+
+def join_depth(widths):
+    """Rounds of join on digits of these widths."""
+    return max(0, math.ceil(math.log2(len(widths))))
+
+
+def join_cost(widths):
+    """AND gates of join on digits of these widths."""
+    if len(widths) <= 1:
+        return 0
+    half = len(widths) // 2
+    return (join_cost(widths[:half]) + join_cost(widths[half:])
+            + (2 ** sum(widths[:half]) - 1) * (2 ** sum(widths[half:]) - 1))
+
+
+# ---------------------------------------------------------------------------
+# Visited check
+# ---------------------------------------------------------------------------
+
+class VisitedCheck:
+    """Membership of n secret addresses in a public, growing list S of opened
+    addresses, followed by the substitution of a dummy for every member.
+
+    An address is split into a high and a low part, x = (h, l).  With the
+    one-hot encodings of the two parts,
+
+        [x in S] = XOR_h  hi[h] AND ( XOR_{l : (h,l) in S} lo[l] ).
+
+    The inner XORs depend on S only through public indices, so they are
+    local.  The two subclasses differ in how hi and lo are obtained.
+
+    If FUSED, the last AND is not shared.  The products
+    hi[h] AND lo[l] over the elements (h, l) of S are formed locally as
+    additive sharings; exactly one of them is 1 if x is in S.  Their XOR is
+    [x in S], and the XOR of those whose element has bit j set is
+    [x in S] AND (bit j of x).  That is all the substitution needs, so the
+    substituted address is opened in the round after hi and lo.
+
+    layout: the digits in which the addresses arrive (see digit_widths)."""
+
+    def __init__(self, n, capacity, layout):
+        self.n = n
+        self.sb = sbits.get_type(n)
+        self.capacity = capacity
+        self.widths, self.low_digits = layout
+        self.LO = (B + 1) // 2
+        self.HI = B // 2
+        self.count = MemValue(regint(0))
+        self.seen = Array(capacity, regint)
+
+    def substitute(self, addr_bits, dummies, member, repeated):
+        """Opens the address, or the dummy where the address is a member of
+        the list or one of the registers in `repeated` is set.  Returns a
+        regint vector."""
+        dummy_bits = public_bits(dummies)
+        if repeated:
+            member = or_tree([member] + repeated)
+        opened = regint(0, size=self.n)
+        for j in range(B):
+            sel = open_and_xor(member, addr_bits[j] ^ dummy_bits[j], addr_bits[j])
+            opened = opened + (sel.to_regint_by_bit() << j)
+        return opened
+
+    def substitute_matched(self, addr_bits, dummies, matched, member):
+        """The same in one round, from additive sharings (see local_and) of
+        `member` and of matched[j] = member AND (bit j of the address):
+
+            opened bit j = addr_j XOR matched_j XOR (member AND dummy_j),
+
+        where the dummies are public."""
+        planes = clear_planes(dummies)
+        opened = regint(0, size=self.n)
+        for j in range(B):
+            sel = open_sum(addr_bits[j] ^ matched[j] ^ (member & planes[j]))
+            opened = opened + (sel.to_regint_by_bit() << j)
+        return opened
+
+
+class DenseCheck(VisitedCheck):
+    """Full one-hot tables of both parts: about 2^LO + 2 * 2^HI AND gates,
+    independent of the size of the list.  Best for narrow addresses."""
+
+    def __init__(self, n, capacity, layout):
+        VisitedCheck.__init__(self, n, capacity, layout)
+        self.seen_hi = Array(capacity, regint)
+        self.seen_lo = Array(capacity, regint)
+        self.low_terms = self.sb.Array(2 ** self.LO)
+        self.high_terms = self.sb.Array(2 ** self.HI)
+        self.groups = self.sb.Array(2 ** self.HI)      # per h: XOR of lo[l], (h, l) in S
+        self.columns = self.sb.Array(2 ** self.LO)     # per l: XOR of hi[h], (h, l) in S
+        self.everyone = identity(2 ** self.LO)
+
+    @staticmethod
+    def cost(capacity, layout):
+        """(rounds, AND gates) of one run."""
+        widths, low = layout
+        rounds = max(join_depth(widths[:low]), join_depth(widths[low:])) + (1 if FUSED else 2)
+        gates = join_cost(widths[:low]) + join_cost(widths[low:]) + (0 if FUSED else 2 ** (B // 2))
+        return rounds, gates
+
+    def reset(self):
+        self.count.write(regint(0))
+
+    def add_public(self, addr_vector):
+        """Appends opened addresses (a regint vector) to the list."""
+        base = self.count.read()
+        hi = addr_vector >> self.LO
+        self.seen.assign_vector(addr_vector, base)
+        self.seen_hi.assign_vector(hi, base)
+        self.seen_lo.assign_vector(addr_vector - (hi << self.LO), base)
+        self.count.write(base + len(addr_vector))
+
+    def run(self, digits, addr_bits, dummies, repeated=None):
+        """digits: one-hot digits of the n addresses; addr_bits: B binary
+        registers of n lanes each; dummies: public addresses (regint vector);
+        repeated: optional registers marking lanes that repeat an earlier
+        lane."""
+        low = join(digits[:self.low_digits])
+        high = join(digits[self.low_digits:])
+        fused = FUSED and not repeated
+        store_registers(self.low_terms, low)
+        clear_cells(self.groups, self.everyone)
+        xor_into(self.groups, self.seen_hi, self.low_terms, self.seen_lo, self.count.read())
+        if fused:
+            store_registers(self.high_terms, high)
+            clear_cells(self.columns, self.everyone)
+            xor_into(self.columns, self.seen_lo, self.high_terms, self.seen_hi, self.count.read())
+
+        if not fused:
+            member = xor_all(high[h] & self.groups[h] for h in range(2 ** self.HI))
+            return self.substitute(addr_bits, dummies, member, repeated)
+        # The products over S, added up by high part and by low part.
+        high_sums, member = bit_sums([local_and(high[h], self.groups[h]) for h in range(2 ** self.HI)])
+        low_sums, _ = bit_sums([local_and(low[l], self.columns[l]) for l in range(2 ** self.LO)])
+        return self.substitute_matched(addr_bits, dummies, low_sums + high_sums, member)
+
+
+class SparseCheck(VisitedCheck):
+    """Only the terms that the list needs: each part is split once more into
+    two sub-parts, lo[l] is formed for the list elements and hi[h] for the
+    distinct high parts of the list.  About 3 * capacity AND gates plus four
+    small one-hot tables.  Best for wide addresses, where 2^LO is larger than
+    the list can ever be."""
+
+    def __init__(self, n, capacity, layout):
+        VisitedCheck.__init__(self, n, capacity, layout)
+        self.cuts = self.split(layout)
+        self.sizes = [sum(self.widths[a:b]) for a, b in zip(self.cuts, self.cuts[1:])]
+        self.LC, self.HA = self.sizes[0], self.sizes[2]
+        self.tables = [self.sb.Array(2 ** s) for s in self.sizes]
+        # per list element: its four sub-parts and the slot of its high part
+        self.seen_parts = [Array(capacity, regint) for _ in range(4)]
+        self.seen_c, self.seen_d = self.seen_parts[:2]
+        self.seen_slot = Array(capacity, regint)
+        self.slot_a = Array(capacity, regint)        # one slot per distinct high part
+        self.slot_b = Array(capacity, regint)
+        self.slot_of = Array(2 ** self.HI, regint)   # slot + 1 of a high part, 0 if none
+        self.slot_of.assign_all(0)
+        self.slots = MemValue(regint(0))
+        self.low_terms = self.sb.Array(capacity)
+        self.high_terms = self.sb.Array(capacity)
+        self.groups = self.sb.Array(capacity)
+        self.buckets = [self.sb.Array(2 ** s) for s in self.sizes]
+        self.everyone = identity(max([capacity] + [2 ** s for s in self.sizes]))
+
+    @staticmethod
+    def split(layout):
+        """Digit indices where the four sub-parts c, d (low) and a, b (high) start."""
+        widths, low = layout
+        return (0, low // 2, low, low + (len(widths) - low) // 2, len(widths))
+
+    @classmethod
+    def cost(cls, capacity, layout):
+        """(rounds, AND gates) of one run with a full list."""
+        widths = layout[0]
+        cuts = cls.split(layout)
+        if any(a == b for a, b in zip(cuts, cuts[1:])):
+            return float("inf"), float("inf")
+        parts = [widths[a:b] for a, b in zip(cuts, cuts[1:])]
+        rounds = max(join_depth(p) for p in parts) + (2 if FUSED else 3)
+        gates = sum(join_cost(p) for p in parts) + (2 if FUSED else 3) * capacity
+        return rounds, gates
+
+    def reset(self):
+        @for_range(self.slots.read())
+        def _(s):
+            self.slot_of[self.slot_a[s] + (self.slot_b[s] << self.HA)] = 0
+            self.groups[s] = self.sb(0)
+
+        self.count.write(regint(0))
+        self.slots.write(regint(0))
+
+    def add_public(self, addr_vector):
+        size = len(addr_vector)
+        incoming = Array(size, regint)
+        incoming.assign_vector(addr_vector)
+        base = self.count.read()
+        self.seen.assign_vector(addr_vector, base)
+
+        @for_range(size)
+        def _(j):
+            addr = incoming[j]
+            h = addr >> self.LO
+            l = addr - (h << self.LO)
+            known = self.slot_of[h]
+            fresh = known == 0
+            slot = fresh * self.slots.read() + (1 - fresh) * (known - 1)
+            self.slot_of[h] = slot + 1
+            self.slot_a[slot] = h - ((h >> self.HA) << self.HA)
+            self.slot_b[slot] = h >> self.HA
+            self.slots.write(self.slots.read() + fresh)
+            self.seen_parts[0][base + j] = l - ((l >> self.LC) << self.LC)
+            self.seen_parts[1][base + j] = l >> self.LC
+            self.seen_parts[2][base + j] = h - ((h >> self.HA) << self.HA)
+            self.seen_parts[3][base + j] = h >> self.HA
+            self.seen_slot[base + j] = slot
+
+        self.count.write(base + size)
+
+    def run(self, digits, addr_bits, dummies, repeated=None):
+        parts = [join(digits[a:b]) for a, b in zip(self.cuts, self.cuts[1:])]
+        for table, terms in zip(self.tables, parts):
+            store_registers(table, terms)
+        tab_c, tab_d, tab_a, tab_b = self.tables
+        # The term of every list element (low part) and of every slot (high
+        # part).  Entries beyond the current size of the list are stale; they
+        # are never added up.
+        if FUSED:
+            and_entries((self.low_terms, tab_c, self.seen_c, tab_d, self.seen_d, self.count.read()),
+                        (self.high_terms, tab_a, self.slot_a, tab_b, self.slot_b, self.slots.read()))
+        else:
+            store_registers(self.low_terms, [tab_c[self.seen_c[i]] & tab_d[self.seen_d[i]]
+                                             for i in range(self.capacity)])
+            store_registers(self.high_terms, [tab_a[self.slot_a[s]] & tab_b[self.slot_b[s]]
+                                              for s in range(self.capacity)])
+
+        if FUSED and not repeated:
+            # One product per list element (the term of its low part times
+            # the term of its high part), added up by each of its sub-parts.
+            everyone = self.everyone
+            matched = []
+            for bucket, part, size in zip(self.buckets, self.seen_parts, self.sizes):
+                clear_cells(bucket, everyone)
+                xor_products_into(bucket, part, self.low_terms, everyone,
+                                  self.high_terms, self.seen_slot, self.count.read())
+                sums, member = bit_sums([bucket[v] for v in range(2 ** size)])
+                matched += sums
+            return self.substitute_matched(addr_bits, dummies, matched, member)
+
+        # Groups of unused slots are zero: memory starts out zero and reset()
+        # clears the slots a query has used.
+        clear_cells(self.groups, self.everyone, self.slots.read())
+        xor_into(self.groups, self.seen_slot, self.low_terms, self.everyone, self.count.read())
+        member = xor_all(self.high_terms[s] & self.groups[s] for s in range(self.capacity))
+        return self.substitute(addr_bits, dummies, member, repeated)
+
+
+def visited_check(n, capacity, layout):
+    """Picks the variant with fewer rounds and, among equals, fewer AND
+    gates (HNSW_CHECK=dense|sparse overrides)."""
+    choice = os.environ.get("HNSW_CHECK", "auto")
+    dense, sparse = DenseCheck.cost(capacity, layout), SparseCheck.cost(capacity, layout)
+    if choice == "auto" or sparse[0] == float("inf"):
+        choice = "dense" if dense <= sparse else "sparse"
+    return (DenseCheck if choice == "dense" else SparseCheck)(n, capacity, layout)
+
+
+def repeated_lanes(bits, n):
+    """bits: B registers of n lanes.  Returns registers whose OR marks the
+    lanes that hold the same value as an earlier lane: register o has lane i
+    set iff lanes i and i - o are equal."""
+    dec = [b.bit_decompose() for b in bits]
+    sbn = sbits.get_type(n)
+    out = []
+    for o in range(1, n):
+        pairs = sbits.get_type(n - o)
+        eq = and_tree(~(pairs.bit_compose(dec[j][o:]) ^ pairs.bit_compose(dec[j][:n - o]))
+                      for j in range(B))
+        out.append(sbn.bit_compose([0] * o + eq.bit_decompose()))
+    return out
+
+
+def repeated_across_rows(row_bits):
+    """row_bits[r][j]: register with bit j of the M neighbours of row r.
+    Returns registers of U*M lanes whose OR marks the neighbours that also
+    occur in an earlier row: register o has lane (r, k) set iff neighbour k
+    of row r occurs in row r - o.
+
+    The neighbours of one row are distinct, so a value matches at most one
+    slot of another row and the matches against the M rotations of that row
+    can be added up with XOR."""
+    sbm = sbits.get_type(M)
+    dec = [[b.bit_decompose() for b in row_bits[r]] for r in range(U - 1)]
+    rotations = {}
+
+    def rotated(r, j, s):
+        if (r, j, s) not in rotations:
+            d = dec[r][j]
+            rotations[r, j, s] = sbm.bit_compose(d[s:] + d[:s])
+        return rotations[r, j, s]
+
+    out = []
+    for o in range(1, U):
+        lanes_out = [0] * (o * M)
+        for r in range(o, U):
+            acc = None
+            for s in range(M):
+                e = and_tree(~(row_bits[r][j] ^ rotated(r - o, j, s)) for j in range(B))
+                acc = e if acc is None else acc ^ e
+            lanes_out += acc.bit_decompose()
+        out.append(sbits.get_type(K).bit_compose(lanes_out))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Selecting the smallest rows by shuffling and opening comparison outcomes
+# ---------------------------------------------------------------------------
+#
+# All arrays hold U groups (one per query) in interleaved order: row i of
+# group g is at index i*U + g.
+
+PAIRS_LIMIT = 1500               # largest array that is ever ranked by all pairs
+
+
+def miss_probability(n, keep, pivots, shortlist):
+    """Probability that no pivot has a rank in [keep, shortlist]."""
+    window = shortlist - keep + 1
+    p = 1.0
+    for i in range(pivots):
+        p *= max(0, n - window - i) / (n - i)
+    return p
+
+
+def selection_plan(n, keep, enabled, max_stages, max_miss=0.2):
+    """At most max_stages stages (pivots, shortlist) that reduce n rows to a
+    shortlist before all pairs are compared; chosen to minimise the expected
+    number of comparisons.  An empty list means: compare all pairs.  Every
+    stage costs one more round of comparisons.  max_miss bounds the
+    probability that a stage has to be repeated."""
+    choice = os.environ.get("HNSW_SELECT", "")
+    if "," in choice and enabled:
+        pivots, shortlist = (int(x) for x in choice.split(","))
+        return [(pivots, shortlist)] if 2 * pivots <= n and keep < shortlist < n else []
+    if not enabled and n <= PAIRS_LIMIT:
+        return []
+    grid = [keep + 2]                              # candidate shortlist lengths
+    while grid[-1] < n:
+        grid.append(max(grid[-1] + 1, int(grid[-1] * 1.12)))
+    memo = {}
+
+    def best(m, left):
+        if (m, left) not in memo:
+            full = m * (m - 1) // 2
+            res = (full if m <= PAIRS_LIMIT else float("inf"), [])
+            pivots = 2
+            while left > 0 and 2 * pivots <= m and pivots <= 512 and pivots * m < res[0]:
+                for c in grid:
+                    if c >= m:
+                        break
+                    miss = min(1.0, U * miss_probability(m, keep, pivots, c))
+                    if miss < max_miss:
+                        tail = best(c, left - 1)
+                        cost = pivots * m / (1 - miss) + tail[0]
+                        if cost < res[0]:
+                            res = (cost, [(pivots, c)] + tail[1])
+                pivots = max(pivots + 1, int(pivots * 1.25))
+            memo[m, left] = res
+        return memo[m, left]
+
+    cost, stages = best(n, max_stages)
+    assert cost < float("inf")
+    if n <= PAIRS_LIMIT and cost > 0.6 * (n * (n - 1) // 2):
+        return []
+    return stages
+
+
+class Dealt:
+    """Comparisons prepared by one party (FUSED).
+
+    The keys sit at `size` positions; lane k compares the keys at positions
+    left[k] and right[k].  Party 0 chooses a random mask of `bits` bits for
+    every position and gives parties 1 and 2 shares of what they need to
+    compare the keys once "key + mask" is open to the two of them: tables
+    for the difference of the two masks of every lane, and products of
+    random bits.  Party 0 never sees a masked key, and parties 1 and 2 each
+    know only one of two summands of a mask.  A comparison takes two
+    rounds; all three parties learn the outcomes.
+
+    parts: list of (left, right), regint vectors of positions."""
+
+    def __init__(self, size, parts, bits, uses):
+        self.size, self.bits, self.uses = size, bits, uses
+        self.lanes = sum(len(left) for left, _ in parts)
+        self.masks = Array(uses * size, sint)
+        self.handles = Array(uses, regint)
+        self.opened = Array(size, cint)
+        self.left = Array(self.lanes, regint)        # positions, per lane
+        self.right = Array(self.lanes, regint)
+        off = 0
+        for left, right in parts:
+            self.left.assign_vector(left, off)
+            self.right.assign_vector(right, off)
+            off += len(left)
+        break_point()
+
+    def prepare(self):
+        """Material for `uses` runs."""
+        for use in range(self.uses):
+            handle = regint()
+            mask = sint(size=self.size)
+            arithmetic_instructions.cmpprep(handle, mask, self.size, self.bits, self.lanes,
+                                            regint(self.left.address), regint(self.right.address))
+            self.handles[use] = handle
+            mask.store_in_mem(self.masks.address + use * self.size)
+
+    def mask(self, use):
+        """The masks of run `use`, one per position."""
+        return sint.load_mem(self.masks.address + use * self.size, size=self.size)
+
+    def open_masked(self, keys, use):
+        """Opens the masked keys to parties 1 and 2 (one round)."""
+        opened = cint(size=self.size)
+        arithmetic_instructions.openpair(self.size, opened, keys + self.mask(use), self.bits)
+        self.opened.assign_vector(opened)
+
+    def compare(self, use, less):
+        """Opens [key_left < key_right] for all lanes into the regint Array
+        `less`, from the masked keys in self.opened and the material of run
+        `use`."""
+        outcome = cint(size=self.lanes)
+        arithmetic_instructions.cmpopen(self.lanes, outcome, self.handles[use],
+                                        self.opened.get_vector(), self.bits)
+        less.assign_vector(regint(outcome))
+
+
+class Prepared:
+    """The same with standard instructions: the material is computed by all
+    three parties and the masked keys are open to all of them.
+
+    Every position i gets a random mask r_i of `bits` bits.  For every lane
+    the difference rho = r_left - r_right is formed on binary shares, and
+    for each chunk of about 8 of its low bits a table with the entries
+    [chunk of rho >= v] for all v.  With the masked keys c_i = key_i + r_i
+    opened,
+
+        key_left - key_right = (c_left - c_right) - rho,
+
+    and its sign follows from comparing the public c_left - c_right with rho
+    chunk by chunk: for a public chunk value v, two table entries are shares
+    of "rho's chunk is larger than v" and "... equals v".  The chunks are
+    combined in a tree of AND gates."""
+
+    def __init__(self, size, parts, bits, uses):
+        self.size, self.bits, self.uses = size, bits, uses
+        self.lanes = sum(len(left) for left, _ in parts)
+        self.lane = sbits.get_type(self.lanes)
+        # Chunks of the low bits: about 8 bits each, 9 if that makes their
+        # number a power of two (a shallower tree of AND gates).
+        low = bits - 1
+        count = -(-low // 8)
+        fewer = 2 ** (count.bit_length() - 1)
+        if -(-low // fewer) <= 9:
+            count = fewer
+        self.chunks = [low // count + 1] * (low % count) + [low // count] * (count - low % count)
+        self.cells = sum(2 ** w + 1 for w in self.chunks)
+        self.masks = Array(uses * size, sint)
+        self.tables = self.lane.Array(uses * self.cells)
+        self.tops = self.lane.Array(uses)
+        self.opened = Array(size, cint)
+        self.mask_bits = Matrix(bits, size, sint)
+        self.left = Array(self.lanes, regint)        # positions, per lane
+        self.right = Array(self.lanes, regint)
+        off = 0
+        for left, right in parts:
+            self.left.assign_vector(left, off)
+            self.right.assign_vector(right, off)
+            off += len(left)
+        break_point()
+
+    def prepare(self):
+        """Material for `uses` runs."""
+        size, bits = self.size, self.bits
+        tables, tops = [], []
+        for use in range(self.uses):
+            r = None
+            for b in range(bits):
+                bit = sint.get_random_bit(size=size)
+                bit.store_in_mem(self.mask_bits.address + b * size)
+                r = bit if r is None else r + bit * 2 ** b
+            r.store_in_mem(self.masks.address + use * size)
+            # Bit b of the two masks of every lane.
+            x, y = [], []
+            for b in range(bits):
+                plane = self.mask_bits.address + b * size
+                x.append(lanes(sint.load_mem(self.left.get_vector() + plane)))
+                y.append(lanes(sint.load_mem(self.right.get_vector() + plane)))
+            rho, borrow = [], None                       # rho = x - y
+            for b in range(bits):
+                t = x[b] ^ y[b]
+                if borrow is None:
+                    rho.append(t)
+                    borrow = t & y[b]
+                else:
+                    rho.append(t ^ borrow)
+                    if b < bits - 1:
+                        borrow = borrow ^ (t & (y[b] ^ borrow))
+            offset = 0
+            for w in self.chunks:
+                equal = join([[~bit, bit] for bit in rho[offset:offset + w]])
+                at_least = [self.lane(0)]                # entry 2^w
+                for v in reversed(range(2 ** w)):
+                    at_least.append(at_least[-1] ^ equal[v])
+                tables += at_least[::-1]
+                offset += w
+            tops.append(rho[bits - 1])
+        store_registers(self.tables, tables)
+        store_registers(self.tops, tops)
+
+    def mask(self, use):
+        """The masks of run `use`, one per position."""
+        return sint.load_mem(self.masks.address + use * self.size, size=self.size)
+
+    def open_masked(self, keys, use):
+        """Opens the masked keys (one round)."""
+        shift = 64 - self.bits
+        self.opened.assign_vector(((keys + self.mask(use)) << shift).reveal() >> shift)
+
+    def compare(self, use, less):
+        """Opens [key_left < key_right] for all lanes into the regint Array
+        `less`, from the masked keys in self.opened and the material of run
+        `use`."""
+        bits = self.bits
+        # c_left - c_right modulo 2^bits, made non-negative
+        diff = (cint.load_mem(self.left.get_vector() + self.opened.address)
+                - cint.load_mem(self.right.get_vector() + self.opened.address) + 2 ** bits)
+        planes = sbits.bit_decompose_clear(diff, bits)
+
+        items = []                                       # per chunk: (rho > c, rho == c)
+        offset = 0
+        first = use * self.cells
+        for w in self.chunks:
+            # Select entries v and v + 1 for the public chunk value v, bit by
+            # bit.
+            both = []
+            for shift in (0, 1):
+                level = [self.tables[first + shift + v] for v in range(2 ** w)]
+                for b in range(w):
+                    m = planes[offset + b]
+                    level = [level[k] ^ ((level[k] ^ level[k + 1]) & m)
+                             for k in range(0, len(level), 2)]
+                both.append(level[0])
+            at_least, above = both
+            items.append((above, at_least ^ above))
+            first = first + 2 ** w + 1
+            offset += w
+
+        # c < rho over all chunks; items[0] is the least significant chunk.
+        while len(items) > 2:
+            merged = []
+            for k in range(0, len(items) - 1, 2):
+                (lo_lt, lo_eq), (hi_lt, hi_eq) = items[k], items[k + 1]
+                merged.append((hi_lt ^ (hi_eq & lo_lt), (hi_eq & lo_eq) if k else None))
+            if len(items) % 2:
+                merged.append(items[-1])
+            items = merged
+        top = self.tops[use]
+        if len(items) == 2:
+            (lo_lt, _), (hi_lt, hi_eq) = items
+            sign = open_and_xor(hi_eq, lo_lt, hi_lt ^ top)
+        else:
+            sign = (items[0][0] ^ top).reveal()
+        # sign of key_left - key_right: top bits of c_left - c_right and
+        # rho, and the borrow
+        public_top = regint((diff >> (bits - 1)) - ((diff >> bits) << 1))
+        opened = sign.to_regint_by_bit()
+        less.assign_vector(opened + public_top - 2 * opened * public_top)
+
+
+class Sorter:
+    """Keeps the `keep` smallest rows of every group, smallest first.
+
+    The rows are shuffled, rows of the same group are compared and the
+    outcomes are opened.  With distinct keys the outcomes are a function of
+    the rank order of the shuffled rows, which is a uniformly random
+    permutation whatever the keys are.
+
+    Either all pairs of rows are compared, or the array is first reduced in
+    stages.  A stage compares every row with a block of pivot rows.  That
+    gives the exact rank of every pivot and places every other row between
+    two pivots, and the rows that come first in that order form a shortlist.
+    The shortlist contains the `keep` smallest rows whenever some pivot has a
+    rank between `keep` and the length of the shortlist.  Whether that is so
+    is public; if not, the stage is repeated with the next block of pivots.
+
+    uses > 0: the comparisons of `uses` runs are prepared by prepare() (see
+    Dealt and Prepared).  The masked keys are opened by the shuffle; a shortlist is
+    masked again and opened in a round of its own.  Then every group is
+    shuffled on its own.  Otherwise one shuffle covers all groups; the group
+    of every shuffled row is opened (it is public before the shuffle) and
+    the rows are put back into interleaved order."""
+
+    def __init__(self, n, width, keep, pivots=False, max_stages=1, uses=0):
+        self.n, self.width, self.keep = n, width, keep
+        self.total = total = n * U
+        self.tie_bits = max(1, math.ceil(math.log2(n)))
+        self.cmp_bits = DIST_BITS + 1 + self.tie_bits + 1
+        assert self.cmp_bits < 63
+        prepared = bool(uses) and PREPARE and max_stages <= 1 and (U == 1 or FUSED)
+        self.stages = selection_plan(n, keep, pivots, max_stages, 0.02 if prepared else 0.2)
+        sizes = [n] + [c for _, c in self.stages]
+        self.out = Matrix(max(m for m in sizes if m <= PAIRS_LIMIT) * U, width, sint)
+        self.grouped = Matrix(total, width, sint)
+        if U > 1:
+            self.group_of = Array(total, regint)
+            self.slot = Array(total, regint)
+            self.fill = Array(U, regint)
+        # Opened comparison outcomes are kept in memory: slices of a long
+        # register vector are expensive for the compiler.
+        outcomes = [m * (m - 1) // 2 for m in sizes if m <= PAIRS_LIMIT]
+        outcomes += [pivots * m for (pivots, _), m in zip(self.stages, sizes)]
+        self.less = Array(max(outcomes) * U, regint)
+        self.rank = Array(self.out.sizes[0], regint)
+
+        # Prepared comparisons: first those of the shuffled array (with all
+        # pairs or with the first block of pivots), then all pairs of the
+        # shortlist.
+        self.first = self.pairs = None
+        self.pairs_n = sizes[-1]
+        if prepared:
+            self.used = MemValue(regint(0))
+            self.use = MemValue(regint(0))
+            m = self.pairs_n * U
+            all_pairs = [(regint.inc(m - d * U), regint.inc(m - d * U, d * U))
+                         for d in range(1, self.pairs_n)]
+            comparisons = Dealt if FUSED else Prepared
+            self.pairs = comparisons(m, all_pairs, self.cmp_bits, uses)
+            if self.stages:
+                count = self.stages[0][0]
+                # lane p * total + x: pivot p of the group of row x, and row x
+                with_pivots = [(regint.inc(total, p * U, 1, 1, U), regint.inc(total))
+                               for p in range(count)]
+                self.first = comparisons(total, with_pivots, self.cmp_bits, uses)
+            else:
+                self.first = self.pairs
+            if U > 1:
+                # Block order (group g, row i) <-> interleaved order.
+                self.by_block = Array(total * width, regint)
+                self.block_position = Array(total, regint)
+                for g in range(U):
+                    self.by_block.assign_vector(
+                        regint.inc(n * width, g * width, 1, 1, width)
+                        + regint.inc(n * width, 0, U * width, width), g * n * width)
+                    self.block_position.assign_vector(regint.inc(n, g, U), g * n)
+                break_point()
+
+        self.mem = []
+        for (pivots, _), m in zip(self.stages, sizes):
+            self.mem.append(dict(
+                keys=Array(m * U, sint), order=Array(m * U, regint), place=Array(m * U, regint),
+                start=Array((2 * pivots + 1) * U, regint), running=Array(U, regint),
+                ordered=Matrix(m * U, width, sint), attempt=MemValue(regint(0)),
+                enough=MemValue(regint(0))))
+
+    def prepare(self):
+        """Material for `uses` runs (nothing if the comparisons are not
+        prepared)."""
+        if self.first is not None:
+            self.first.prepare()
+            if self.pairs is not self.first:
+                self.pairs.prepare()
+            self.used.write(regint(0))
+
+    def fill_keys(self, mat):
+        """Fills the key column (and the query column) of the n*U-row array
+        `mat`, whose column 1 holds the distkeys."""
+        size, width = self.total, self.width
+        distkey = sint.load_mem(regint.inc(size, mat.address + 1, width))
+        key = distkey * 2 ** self.tie_bits + regint.inc(size, 0, 1, U)
+        key.store_in_mem(regint.inc(size, mat.address, width))
+        if U > 1:
+            sint(regint.inc(size, 0, 1, 1, U)).store_in_mem(
+                regint.inc(size, mat.address + width - 1, width))
+
+    def shuffle(self, flat, mask=None, blocks=1):
+        """Shuffles the rows (within each of `blocks` blocks).  With a mask
+        (one value per row), also opens the masked keys of the shuffled
+        rows; if FUSED, that happens in the second and last round of the
+        shuffle.  Returns (rows, opened masked keys)."""
+        width, total = self.width, self.total
+        opened = None
+        if FUSED:
+            rows = sint(size=total * width)
+            opened = cint(size=total)
+            # (the masked keys go to parties 1 and 2 only, see Dealt)
+            arithmetic_instructions.shuffleopen(
+                total * width, rows, flat, width, 0 if mask is None else self.cmp_bits,
+                sint(0, size=total) if mask is None else mask, opened, blocks, 1)
+        else:
+            assert blocks == 1
+            rows = flat.secure_shuffle(width)
+            if mask is not None:
+                shift = 64 - self.cmp_bits
+                opened = ((rows.get_vector(0, total, width) + mask) << shift).reveal() >> shift
+        return rows, opened
+
+    def run(self, mat):
+        """mat: n*U rows with the distkeys in column 1.  Returns the `keep`
+        smallest rows of every group as one vector."""
+        width, total = self.width, self.total
+        self.fill_keys(mat)
+        if self.first is not None:
+            use = self.used.read()
+            self.used.write(use + 1)
+            self.use.write(use)
+            if U > 1:
+                order = self.by_block.get_vector()
+                position = self.block_position.get_vector()
+                rows, opened = self.shuffle(
+                    sint.load_mem(mat.address + order),
+                    sint.load_mem(self.first.masks.address + use * total + position), U)
+                rows.store_in_mem(self.grouped.address + order)
+                rows = sint.load_mem(self.grouped.address, size=total * width)
+                opened.store_in_mem(self.first.opened.address + position)
+            else:
+                rows, opened = self.shuffle(sint.load_mem(mat.address, size=total * width),
+                                            self.first.mask(use))
+                self.first.opened.assign_vector(opened)
+            self.select(rows, self.n, 0, opened=True)
+            return sint.load_mem(self.out.address, size=self.keep * U * width)
+
+        rows, _ = self.shuffle(sint.load_mem(mat.address, size=total * width))
+        if U > 1:
+            self.group_of.assign_vector(regint(rows.get_vector(width - 1, total, width).reveal()))
+            self.fill.assign_all(0)
+
+            @for_range(total)
+            def _(i):
+                g = self.group_of[i]
+                c = self.fill[g]
+                self.slot[i] = c * U + g
+                self.fill[g] = c + 1
+
+            slot = self.slot.get_vector()
+            for c in range(width):
+                rows.get_vector(c, total, width).store_in_mem(self.grouped.address + slot * width + c)
+            rows = sint.load_mem(self.grouped.address, size=total * width)
+
+        self.select(rows, self.n, 0)
+        return sint.load_mem(self.out.address, size=self.keep * U * width)
+
+    def compare(self, left, right):
+        """Opens [left < right] element by element into self.less."""
+        self.less.assign_vector(
+            comparison.LtzRingRaw(left - right, self.cmp_bits).reveal().to_regint_by_bit())
+
+    def outcomes(self, base, size):
+        return regint.load_mem(self.less.address + base, size=size)
+
+    def select(self, rows, n, stage, opened=False):
+        """opened: the masked keys of the rows are open already."""
+        if stage == len(self.stages):
+            self.by_pairs(rows, n, opened)
+        else:
+            self.by_pivots(rows, n, stage, opened)
+
+    def by_pairs(self, rows, n, opened=False):
+        """Ranks n rows per group by comparing all pairs and writes the rows
+        to self.out in rank order."""
+        width, total = self.width, n * U
+        keys = rows.get_vector(0, total, width)
+        if self.pairs is not None and n == self.pairs_n:
+            use = self.use.read()
+            if not opened:
+                self.pairs.open_masked(keys, use)
+            self.pairs.compare(use, self.less)
+        else:
+            left = sint.concat(keys.get_vector(0, (n - d) * U) for d in range(1, n))
+            right = sint.concat(keys.get_vector(d * U, (n - d) * U) for d in range(1, n))
+            self.compare(left, right)
+
+        # rank[x] = number of rows of the same group with a smaller key
+        rank = self.rank
+        rank.assign_vector(regint(0, size=total))
+        off = 0
+        for d in range(1, n):
+            size = (n - d) * U
+            part = self.outcomes(off, size)              # [key_i < key_{i+d}]
+            off += size
+            upper = regint.load_mem(rank.address + d * U, size=size)
+            (upper + part).store_in_mem(rank.address + d * U)
+            lower = regint.load_mem(rank.address, size=size)
+            (lower + 1 - part).store_in_mem(rank.address)
+        dest = regint.load_mem(rank.address, size=total) * U + regint.inc(total, 0, 1, 1, U)
+        for c in range(width):
+            rows.get_vector(c, total, width).store_in_mem(self.out.address + dest * width + c)
+
+    def by_pivots(self, rows, n, stage, opened=False):
+        width, total = self.width, n * U
+        pivots, shortlist = self.stages[stage]
+        mem = self.mem[stage]
+        keys, order, place, start = mem["keys"], mem["order"], mem["place"], mem["start"]
+        group = regint.inc(total, 0, 1, 1, U)
+        index = regint.inc(total)
+        size = pivots * total
+        blocks = n // pivots
+
+        keys.assign_vector(rows.get_vector(0, total, width))
+        mem["attempt"].write(regint(0))
+
+        @do_while
+        def _():
+            attempt = mem["attempt"].read()
+            first = attempt * (pivots * U)               # index of the first pivot row
+
+            # Every pivot against every row.
+            if opened:
+                # The first block of pivots has prepared comparisons.  A
+                # repetition takes the pivots a few at a time, which keeps
+                # the registers of this branch small.
+                @if_e(attempt == 0)
+                def _():
+                    self.first.compare(self.use.read(), self.less)
+
+                @else_
+                def _():
+                    step = max(1, min(pivots, 65536 // total))
+                    part = step * total
+
+                    @for_range(-(-pivots // step))
+                    def _(k):
+                        p = (k * step < pivots - step).if_else(k * step, pivots - step)
+                        pivot = sint.load_mem(regint.inc(part, keys.address, U, total)
+                                              + regint.inc(part, 0, 1, 1, U) + (first + p * U))
+                        row = sint.load_mem(regint.inc(part, keys.address, 1, 1, total))
+                        comparison.LtzRingRaw(pivot - row, self.cmp_bits).reveal().to_regint_by_bit() \
+                            .store_in_mem(self.less.address + p * total)
+            else:
+                left = sint.load_mem(regint.inc(size, keys.address, U, total) + regint.inc(size, 0, 1, 1, U)
+                                     + regint.inc(size, first, 0))
+                right = sint.load_mem(regint.inc(size, keys.address, 1, 1, total))
+                self.compare(left, right)
+
+            # below[x] = number of pivots smaller than row x.  A pivot with j
+            # smaller pivots goes between the rows with below = j and those
+            # with below = j + 1; sorting by 2 * below (+1 for a pivot) puts
+            # every pivot at its exact rank.
+            below = self.outcomes(0, total)
+            for p in range(1, pivots):
+                below = below + self.outcomes(p * total, total)
+            offset = index - regint.inc(total, first, 0)
+            is_pivot = (offset < pivots * U) * (1 - (offset < 0))
+            order.assign_vector((2 * below + is_pivot) * U + group)
+
+            # Counting sort per group.
+            start.assign_all(0)
+
+            @for_range(total)
+            def _(x):
+                k = order[x]
+                start[k] = start[k] + 1
+
+            mem["running"].assign_all(0)
+
+            @for_range(2 * pivots + 1)
+            def _(k):
+                for g in range(U):
+                    count = start[k * U + g]
+                    start[k * U + g] = mem["running"][g]
+                    mem["running"][g] = mem["running"][g] + count
+
+            @for_range(total)
+            def _(x):
+                k = order[x]
+                place[x] = start[k]
+                start[k] = start[k] + 1
+
+            # The shortlist is enough if, in every group, some pivot has a
+            # rank in [keep, shortlist]: everything after that pivot is larger.
+            pivot_rank = regint.load_mem(regint.inc(pivots * U, place.address) + regint.inc(pivots * U, first, 0))
+            inside = (1 - (pivot_rank < self.keep)) * (pivot_rank < shortlist + 1)
+            hits = inside.get_vector(0, U)
+            for p in range(1, pivots):
+                hits = hits + inside.get_vector(p * U, U)
+            enough = regint(1)
+            for g in range(U):
+                enough = enough * (hits[g] > 0)
+            mem["enough"].write(enough)
+            mem["attempt"].write(attempt + 1)
+            return (1 - enough) * (attempt + 1 < blocks)
+
+        dest = place.get_vector() * U + group
+        for c in range(width):
+            rows.get_vector(c, total, width).store_in_mem(mem["ordered"].address + dest * width + c)
+
+        @if_e(mem["enough"].read())
+        def _():
+            self.select(sint.load_mem(mem["ordered"].address, size=shortlist * U * width),
+                        shortlist, stage + 1)
+
+        @else_
+        def _():
+            # Every block of pivots missed.  (With prepared comparisons the
+            # plan makes that practically impossible for a large array, and
+            # the registers for comparing all its pairs are not reserved.)
+            if n <= PAIRS_LIMIT and (not opened or n * (n - 1) // 2 * U <= 50000):
+                self.by_pairs(sint.load_mem(mem["ordered"].address, size=total * width), n)
+            else:
+                print_ln("selection failed: every block of pivots missed (negligible "
+                         "probability unless HNSW_SELECT forces unsuitable parameters)")
+                crash()
+
+
+# ---------------------------------------------------------------------------
+# Search state
+# ---------------------------------------------------------------------------
+#
+# C holds T rows per query, sorted.  Every iteration pops row 0 of every
+# query, reads the graph rows of the popped nodes, checks the neighbours
+# against the visited list, reads their vectors and merges the scored
+# neighbours into C.
+#
+# The result array W is not maintained during the iterations.  A row that is
+# among the ef best of all rows ever scored has fewer than ef <= T better
+# rows, so it is never pushed out of C and leaves it only by being popped.
+# The ef best rows are therefore among the popped rows and the rows that the
+# last iteration merges, and the last merge produces W directly.
+#
+# Several queries on one shuffled copy (multi mode).  A table address may be
+# opened only once, so a later query cannot fetch a vector that an earlier
+# query fetched.  It does not have to: the addresses opened so far are
+# public, so the rows behind them can be read again at no cost in privacy.
+# A query therefore starts by scoring every vector fetched so far and keeps
+# the T best as its initial C.  From then on a neighbour that is in the
+# visited list has already been offered to this query and is skipped, and a
+# popped node whose graph row was opened before has nothing new to offer and
+# reads the dummy row.  Batch mode works the same way, with all queries
+# scoring every vector at the time it is fetched.
+
+POOL = T - 1 + K                                 # rows merged by an iteration
+LAST = 2 * T - 1 + K                             # ... by the last one: plus the popped rows
+
+C = Matrix(T * U, W, sint)
+popped = Matrix(T * U, 2, sint)                  # (distkey, b) of the popped rows
+pool = Matrix(POOL * U, W, sint)
+last_pool = Matrix(LAST * U, W, sint)
+results = Matrix(Q, EF, cint)
+
+merge_with_pivots = os.environ.get("HNSW_SELECT", "pivots" if BATCH else "pairs") != "pairs"
+# Comparisons are prepared for a whole query, or, in batch mode, where the
+# material of an iteration is large, iteration by iteration.
+iter_sort = Sorter(POOL, W, T, merge_with_pivots, uses=1 if BATCH else T - 1)
+last_sort = Sorter(LAST, W, EF, merge_with_pivots, uses=1)
+ahead = [last_sort] if BATCH else [iter_sort, last_sort]
+
+
+@function_block
+def prepare():
+    """Input-independent preparation of one query or batch (timer 2)."""
+    start_timer(2)
+    for sorter in ahead:
+        sorter.prepare()
+    wait_for_all()
+    stop_timer(2)
+
+
+@function_block
+def prepare_iteration():
+    """The same for one iteration of a batch, between two iterations."""
+    stop_timer(1)
+    start_timer(2)
+    iter_sort.prepare()
+    wait_for_all()
+    stop_timer(2)
+    start_timer(1)
+
+
+if BATCH:
+    vec_capacity = U + 1 + T * K
+elif MULTI:
+    vec_capacity = 1 + Q * (T + 1) * K
+else:
+    vec_capacity = 2 + T * K
+check_v = visited_check(K, vec_capacity, STORED)
+if SHARED:
+    check_g = visited_check(GL, 1 + GRAPH_STEPS * GL, BITWISE)
+if BATCH:
+    entry_pool = Matrix((T + U) * U, W, sint)
+    entry_sort = Sorter(T + U, W, T, uses=1)
+    ahead.append(entry_sort)
+
+q_cols = Matrix(D, U, sint)                      # queries as columns
+qq = Array(U, sint)                              # squared norms of the queries
+
+
+def set_queries(first):
+    for u in range(U):
+        q = queries[first + u].get_vector()
+        q_cols.set_column(u, q)
+        qq[u] = sint.dot_product(q, q)
+
+
+def write_rows(mat, first_row, opened):
+    """Scores the vectors at the public addresses `opened` against every
+    query and writes the rows (index k*U + u) into `mat` from `first_row`."""
+    n = len(opened)
+    rows = rows_of(opened)
+    vectors = fetch_rows(vec, rows)
+    norms = sint.load_mem(norm.address + rows)
+    products = sint.matrix_mul(vectors, q_cols.get_vector(), D)       # n x U
+    q_tiled = sint.load_mem(regint.inc(n * U, qq.address, 1, 1, U))
+    distkey = repeat(norms, U) - 2 * products + q_tiled
+
+    def column(c):
+        return regint.inc(n * U, mat.address + first_row * W + c, W)
+
+    address = repeat(sint(opened), U)
+    distkey.store_in_mem(column(1))
+    address.store_in_mem(column(2))
+    if SHARED:
+        for j in range(B):
+            repeat(sint(bit_of(opened, j)), U).store_in_mem(column(A_COL + j))
+    else:
+        address.store_in_mem(column(A_COL))
+
+
+def sentinel_rows(mat, first_row, count):
+    """count rows per query, from `first_row`, that sort behind everything else."""
+    addr = regint.inc(count * U, C_SENT, 1, U)
+
+    def column(c):
+        return regint.inc(count * U, mat.address + first_row * U * W + c, W)
+
+    sint(SENT_KEY, size=count * U).store_in_mem(column(1))
+    sint(addr).store_in_mem(column(2))
+    if SHARED:
+        for j in range(B):
+            sint(bit_of(addr, j)).store_in_mem(column(A_COL + j))
+    else:
+        sint(addr).store_in_mem(column(A_COL))
+
+
+def iteration(t, vec_step, graph_step, last, first_query):
+    """t: iteration; vec_step / graph_step: index of the dummies to use."""
+    state = C.get_vector()
+    heads = state.get_vector(0, U * W)
+    heads.get_vector(1, U, W).store_in_mem(regint.inc(U, popped.address, 2) + t * U * 2)
+    heads.get_vector(2, U, W).store_in_mem(regint.inc(U, popped.address + 1, 2) + t * U * 2)
+
+    if SHARED:
+        # Graph access: heads that were opened before, or that repeat the
+        # head of another query, read the dummy row.
+        head_bits = []
+        for j in range(B):
+            column = heads.get_vector(A_COL + j, U, W)
+            if GL > U:                           # padding lane: sigma
+                column = sint.concat([column, sint((SIGMA >> j) & 1, size=GL - U)])
+            head_bits.append(lanes(column))
+        dummies = regint.inc(GL, GRAPH_DUM) + graph_step * GL
+        opened_g = check_g.run([[~b, b] for b in head_bits], head_bits, dummies,
+                               repeated_lanes(head_bits, U) if U > 1 else None)
+        check_g.add_public(opened_g)
+        fetched = fetch_rows(graph, rows_of(opened_g.get_vector(0, U)))
+    else:
+        head = regint(heads.get_vector(A_COL, 1).reveal())
+        fetched = sint.load_mem(graph.address + rows_of(head) * (GCOLS * M), size=GCOLS * M)
+
+    digits = stored_digits(fetched, range(U))
+    if U > 1:
+        repeated = repeated_across_rows(
+            [bits_of(stored_digits(fetched, [r]), STORED[0]) for r in range(U)])
+    else:
+        repeated = None
+    dummies = regint.inc(K, VEC_DUM) + vec_step * K
+    opened = check_v.run(digits, bits_of(digits, STORED[0]), dummies, repeated)
+    check_v.add_public(opened)
+
+    rest = state.get_vector(U * W, (T - 1) * U * W)
+    if not last:
+        pool.assign_vector(rest)
+        write_rows(pool, (T - 1) * U, opened)
+        C.assign_vector(iter_sort.run(pool))
+    else:
+        # Popped rows, the rest of C and the new rows: the ef best are W.
+        done = popped.get_vector()
+        done.get_vector(0, T * U, 2).store_in_mem(regint.inc(T * U, last_pool.address + 1, W))
+        done.get_vector(1, T * U, 2).store_in_mem(regint.inc(T * U, last_pool.address + 2, W))
+        last_pool.assign_vector(rest, T * U * W)
+        write_rows(last_pool, (2 * T - 1) * U, opened)
+        best = last_sort.run(last_pool)
+        for u in range(U):
+            results[first_query + u].assign_vector(best.get_vector(u * W + 2, EF, U * W).reveal())
+
+
+def search(first, number=0):
+    """Searches queries first .. first+U-1 and stores their results.
+    number: compile-time index of the query in multi mode."""
+    set_queries(first)
+    sigma = regint(SIGMA, size=1)
+    vec_step, graph_step = 0, 0
+
+    if BATCH:
+        # Entry points are public.  A repeated entry point is replaced by a
+        # dummy, then every entry point is scored for every query.
+        check_v.reset()
+        check_g.reset()
+        check_g.add_public(sigma)
+        e = [entries[first + u] for u in range(U)]
+        opened = []
+        for u in range(U):
+            dup = regint(0)
+            for v in range(u):
+                same = e[u] == e[v]
+                dup = dup + same - dup * same
+            opened.append(e[u] + dup * (N + u - e[u]))
+        opened = regint.concat(opened)
+        check_v.add_public(regint.concat([sigma, opened]))
+        sentinel_rows(entry_pool, 0, T)
+        write_rows(entry_pool, T * U, opened)
+        C.assign_vector(entry_sort.run(entry_pool))
+    elif MULTI:
+        if number == 0:
+            check_v.add_public(sigma)
+            check_g.add_public(sigma)
+        # The entry point goes through the visited check like a neighbour:
+        # lane 0 holds it, the other lanes hold sigma.
+        vec_step = number * (T + 1)
+        graph_step = number * T
+        lookup = regint.concat([entries[first], regint(SIGMA, size=M - 1)])
+        dummies = regint.inc(M, VEC_DUM) + vec_step * M
+        opened = check_v.run(public_digits(lookup, STORED[0]), public_bits(lookup), dummies, None)
+        check_v.add_public(opened)
+        vec_step += 1
+        # Score everything fetched so far and keep the T best.
+        fetched = 1 + (number * (T + 1) + 1) * M
+        start = Matrix(T + fetched, W, sint)
+        start_sort = Sorter(T + fetched, W, T, True, 4)
+        sentinel_rows(start, 0, T)
+        write_rows(start, T, check_v.seen.get_vector(0, fetched))
+        C.assign_vector(start_sort.run(start))
+    else:
+        check_v.reset()
+        entry = entries[first]
+        check_v.add_public(regint.concat([sigma, entry]))
+        write_rows(C, 0, entry)
+        if T > 1:
+            sentinel_rows(C, 1, T - 1)
+
+    if T > 1:
+        @for_range(T - 1)
+        def _(t):
+            if BATCH:
+                prepare_iteration()
+            iteration(t, vec_step + t, graph_step + t, False, first)
+    iteration(regint(T - 1), vec_step + T - 1, graph_step + T - 1, True, first)
+
+
+# Timer 1: the search.  Timer 2: preparation that does not depend on the
+# query or the tables.
+if BATCH:
+    prepare()
+    start_timer(1)
+    search(0)
+    stop_timer(1)
+elif MULTI:
+    for number in range(Q):
+        prepare()
+        start_timer(1)
+        search(regint(number), number)
+        stop_timer(1)
+else:
+    @for_range(Q)
+    def _(qi):
+        prepare()
+        start_timer(1)
+        search(qi)
+        stop_timer(1)
+
+
+@for_range(Q)
+def _(qi):
+    print_ln("RESULT %s %s", qi, results[qi].get_vector())

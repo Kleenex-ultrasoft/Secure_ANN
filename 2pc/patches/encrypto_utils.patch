@@ -1,0 +1,37 @@
+diff --git a/src/ENCRYPTO_utils/channel.cpp b/src/ENCRYPTO_utils/channel.cpp
+index 6818757..b9293a1 100644
+--- a/src/ENCRYPTO_utils/channel.cpp
++++ b/src/ENCRYPTO_utils/channel.cpp
+@@ -136,7 +136,13 @@ void channel::blocking_receive(uint8_t* rcvbuf, uint64_t rcvsize) {
+ 
+ 
+ bool channel::is_alive() {
+-	return (!(queue_empty() && m_eFin->IsSet()));
++	// Read the end-of-stream flag before the queue.  The peer's end marker
++	// always follows its last data block, so once the flag is seen every
++	// block is already queued.  Checking the queue first can observe
++	// "empty", then "finished", while the last block arrived in between,
++	// and report a channel with pending data as dead.
++	const bool finished = m_eFin->IsSet();
++	return !(finished && queue_empty());
+ }
+ 
+ bool channel::data_available() {
+@@ -154,10 +160,15 @@ void channel::wait_for_fin() {
+ }
+ 
+ void channel::synchronize_end() {
+-	if(m_bSndAlive)
+-		signal_end();
++	// Drop unread blocks before announcing the end.  The peer starts its
++	// next exchange on this channel id only after it has seen our end
++	// marker, so nothing that belongs to that exchange can be queued yet.
++	// Flushing after the marker could discard the peer's first block of the
++	// next exchange and leave the next receive waiting forever.
+ 	if(m_bRcvAlive)
+ 		m_cRcver->flush_queue(m_bChannelID);
++	if(m_bSndAlive)
++		signal_end();
+ 	if(m_bRcvAlive)
+ 		wait_for_fin();
+ 

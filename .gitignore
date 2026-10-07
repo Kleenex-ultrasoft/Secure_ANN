@@ -1,0 +1,11 @@
+# build trees and run output
+build/
+hnsecw_work/
+hnsecw_3pc_work/
+*.log
+*.npz
+*.npy
+
+# Python cache
+__pycache__/
+*.pyc

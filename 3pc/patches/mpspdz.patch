@@ -1,0 +1,1670 @@
+diff --git a/Compiler/GC/instructions.py b/Compiler/GC/instructions.py
+index ec34425..b72df5c 100644
+--- a/Compiler/GC/instructions.py
++++ b/Compiler/GC/instructions.py
+@@ -54,11 +54,16 @@ opcodes = dict(
+     SPLIT = 0x248,
+     CONVCBIT2S = 0x249,
+     ANDRSVEC = 0x24a,
++    LOCALAND = 0x24b,
++    XORMEMB = 0xF8,
++    ANDMEMB = 0xEF,
++    XORANDMEMB = 0xF9,
+     XORCBI = 0x210,
+     BITDECC = 0x211,
+     NOTCB = 0x212,
+     CONVCINT = 0x213,
+     REVEAL = 0x214,
++    REVEALSUM = 0x216,
+     STMSDCI = 0x215,
+     LDMCB = 0x217,
+     STMCB = 0x218,
+@@ -630,6 +635,111 @@ class reveal(BinaryVectorInstruction, base.VarArgsInstruction, base.Mergeable):
+         req_node.increment(('bit', 'open'), sum(
+             int(math.ceil(x / 64)) * 8 for x in self.args[0::3]))
+ 
++class localand(BinaryVectorInstruction):
++    """ Bitwise AND of secret bit register vectors without communication.
++    The result is an additive sharing of the product (every party holds
++    one summand) instead of a replicated sharing. It can be combined
++    with XOR and with AND by clear bits, and it has to be opened with
++    :py:class:`revealsum`. Only for semi-honest three-party replicated
++    secret sharing.
++
++    :param: number of arguments to follow (multiple of four)
++    :param: number of bits (int)
++    :param: result (sbit)
++    :param: operand (sbit)
++    :param: operand (sbit)
++    :param: (repeat from number of bits)...
++    """
++    code = opcodes['LOCALAND']
++    arg_format = tools.cycle(['int','sbw','sb','sb'])
++
++class revealsum(BinaryVectorInstruction, base.VarArgsInstruction, base.Mergeable):
++    """ Reveal secret bit register vectors that hold additive or
++    replicated sharings and copy the result to clear bit register
++    vectors. Every party sends its summand, masked with a fresh sharing
++    of zero, to both other parties, so that the product of two
++    replicated sharings (see :py:class:`localand`) is opened in one round.
++
++    :param: number of arguments to follow (multiple of three)
++    :param: number of bits (int)
++    :param: destination (cbit)
++    :param: source (sbit)
++    :param: (repeat from number of bits)...
++    """
++    code = opcodes['REVEALSUM']
++    arg_format = tools.cycle(['int','cbw','sb'])
++
++    def add_usage(self, req_node):
++        req_node.increment(('bit', 'open'), sum(
++            int(math.ceil(x / 64)) * 8 for x in self.args[0::3]))
++
++class xormemb(base.DoNotEliminateInstruction, base.VarArgsInstruction):
++    """ XOR entries of secret bit memory into other entries, with the
++    entries chosen by index arrays in integer memory:
++    ``dest[dest_index[i]] ^= source[source_index[i]]`` for ``i`` below
++    the count. An entry is a register vector of the given number of
++    bits. The memory addresses are only known at run time, so the
++    instruction should be in a basic block of its own.
++
++    :param: number of arguments to follow (seven)
++    :param: number of bits per entry (int)
++    :param: address of destination entry 0 (regint)
++    :param: address of destination indices in integer memory (regint)
++    :param: address of source entry 0 (regint)
++    :param: address of source indices in integer memory (regint)
++    :param: count (regint)
++    :param: 1 to assign instead of XOR (int)
++    """
++    code = opcodes['XORMEMB']
++    arg_format = ['int','ci','ci','ci','ci','ci','int']
++
++    def has_var_args(self):
++        return True
++
++class xorandmemb(base.DoNotEliminateInstruction, base.VarArgsInstruction):
++    """ XOR local products of entries of secret bit memory into other
++    entries (see :py:class:`localand` and :py:class:`xormemb`):
++    ``dest[dest_index[i]] ^= localand(a[a_index[i]], b[b_index[i]])``
++    for ``i`` below the count. No communication; the destination holds
++    additive sharings.
++
++    :param: number of arguments to follow (eight)
++    :param: number of bits per entry (int)
++    :param: address of destination entry 0 (regint)
++    :param: address of destination indices in integer memory (regint)
++    :param: address of entry 0 of a (regint)
++    :param: address of the indices into a in integer memory (regint)
++    :param: address of entry 0 of b (regint)
++    :param: address of the indices into b in integer memory (regint)
++    :param: count (regint)
++    """
++    code = opcodes['XORANDMEMB']
++    arg_format = ['int','ci','ci','ci','ci','ci','ci','ci']
++
++    def has_var_args(self):
++        return True
++
++class andmemb(base.DoNotEliminateInstruction, base.VarArgsInstruction):
++    """ AND of entries of secret bit memory chosen by index arrays in
++    integer memory: ``dest[i] = a[a_index[i]] & b[b_index[i]]`` for
++    ``i`` below the count. An entry is a register vector of the given
++    number of bits. All groups of arguments are processed in the same
++    round. The memory addresses are only known at run time, so the
++    instruction should be in a basic block of its own.
++
++    :param: number of arguments to follow (multiple of seven)
++    :param: number of bits per entry (int)
++    :param: address of destination entry 0 (regint)
++    :param: address of entry 0 of a (regint)
++    :param: address of the indices into a in integer memory (regint)
++    :param: address of entry 0 of b (regint)
++    :param: address of the indices into b in integer memory (regint)
++    :param: count (regint)
++    :param: (repeat from number of bits)...
++    """
++    code = opcodes['ANDMEMB']
++    arg_format = tools.cycle(['int','ci','ci','ci','ci','ci','ci'])
++
+ class inputb(base.DoNotEliminateInstruction, base.VarArgsInstruction):
+     """ Copy private input to secret bit register vectors. The input is
+     read as floating-point number, multiplied by a power of two, and then
+diff --git a/Compiler/instructions.py b/Compiler/instructions.py
+index cf56930..5bbc872 100644
+--- a/Compiler/instructions.py
++++ b/Compiler/instructions.py
+@@ -2936,6 +2936,118 @@ class inverse_permutation(base.VectorInstruction, shuffle_base):
+         self.add_apply_usage(req_node, len(self.args[0]), 1)
+ 
+ 
++class shuffleopen(base.VarArgsInstruction):
++    """ Secure shuffle of rows of secret registers in two rounds,
++    optionally together with the opening of the first entry of every
++    shuffled row plus a secret mask. The opening happens in the second
++    round of the shuffle. The rows can be divided into blocks of equal
++    size that are shuffled independently. Only for semi-honest
++    three-party replicated secret sharing.
++
++    :param: number of arguments to follow (nine)
++    :param: number of registers, rows times row length (int)
++    :param: destination (sint)
++    :param: source (sint)
++    :param: row length (int)
++    :param: number of bits to open of every masked entry, 0 for none (int)
++    :param: masks, one per row (sint)
++    :param: opened values, one per row (cint)
++    :param: number of blocks (int)
++    :param: 1 to open to parties 1 and 2 only, as :py:class:`cmpopen` needs (int)
++    """
++    __slots__ = []
++    code = base.opcodes['SHUFFLEOPEN']
++    arg_format = ['int','sw','s','int','int','s','cw','int','int']
++    is_vec = lambda self: True
++
++    def __init__(self, *args, **kwargs):
++        super(shuffleopen, self).__init__(*args, **kwargs)
++        size, dest, source, unit, n_bits, mask, opened, blocks, pair = args
++        assert size == len(dest) == len(source)
++        assert size % (unit * blocks) == 0
++        assert 0 <= n_bits <= 64
++        assert len(mask) == len(opened) == size // unit
++
++    def has_var_args(self):
++        return True
++
++class cmpprep(base.VarArgsInstruction):
++    """ Prepare comparisons between masked values with party 0 as
++    dealer. Party 0 chooses a mask for each of a number of positions and
++    provides parties 1 and 2 with the material to compare, in every
++    lane, the values that will sit at two of the positions. Only for
++    semi-honest three-party replicated secret sharing.
++
++    :param: number of arguments to follow (seven)
++    :param: handle for :py:class:`cmpopen` (regint)
++    :param: masks, one per position (sint)
++    :param: number of positions (int)
++    :param: number of bits per value including the sign (int)
++    :param: number of lanes (int)
++    :param: address of the left position of every lane in integer memory (regint)
++    :param: address of the right position of every lane in integer memory (regint)
++    """
++    __slots__ = []
++    code = base.opcodes['CMPPREP']
++    arg_format = ['ciw','sw','int','int','int','ci','ci']
++    is_vec = lambda self: True
++
++    def __init__(self, *args, **kwargs):
++        super(cmpprep, self).__init__(*args, **kwargs)
++        assert len(args[1]) == args[2]
++        assert 2 <= args[3] <= 62
++
++    def has_var_args(self):
++        return True
++
++class cmpopen(base.VarArgsInstruction):
++    """ Open, for every lane prepared by :py:class:`cmpprep`, whether the
++    value at the left position is smaller than the one at the right
++    position, in two rounds. The masked values must have been opened to
++    parties 1 and 2 only (:py:class:`shuffleopen`,
++    :py:class:`openpair`). The prepared material is used up.
++
++    :param: number of arguments to follow (five)
++    :param: number of lanes (int)
++    :param: results, one per lane (cint)
++    :param: handle (regint)
++    :param: masked values, one per position (cint)
++    :param: number of bits per value including the sign (int)
++    """
++    __slots__ = []
++    code = base.opcodes['CMPOPEN']
++    arg_format = ['int','cw','ci','c','int']
++    is_vec = lambda self: True
++
++    def __init__(self, *args, **kwargs):
++        super(cmpopen, self).__init__(*args, **kwargs)
++        assert len(args[1]) == args[0]
++
++    def has_var_args(self):
++        return True
++
++class openpair(base.VarArgsInstruction):
++    """ Open the low bits of secret registers to parties 1 and 2 only
++    (one round). The clear registers of party 0 are not defined.
++
++    :param: number of arguments to follow (four)
++    :param: number of registers (int)
++    :param: destination (cint)
++    :param: source (sint)
++    :param: number of bits (int)
++    """
++    __slots__ = []
++    code = base.opcodes['OPENPAIR']
++    arg_format = ['int','cw','s','int']
++    is_vec = lambda self: True
++
++    def __init__(self, *args, **kwargs):
++        super(openpair, self).__init__(*args, **kwargs)
++        assert len(args[1]) == len(args[2]) == args[0]
++
++    def has_var_args(self):
++        return True
++
+ class check(base.Instruction):
+     """
+     Force MAC check in current thread and all idle thread if current
+diff --git a/Compiler/instructions_base.py b/Compiler/instructions_base.py
+index 5f6b825..df8166a 100644
+--- a/Compiler/instructions_base.py
++++ b/Compiler/instructions_base.py
+@@ -121,6 +121,10 @@ opcodes = dict(
+     APPLYSHUFFLE = 0xFC,
+     DELSHUFFLE = 0xFD,
+     INVPERM = 0xFE,
++    SHUFFLEOPEN = 0xF7,
++    CMPPREP = 0xD4,
++    CMPOPEN = 0xD5,
++    OPENPAIR = 0xD6,
+     # Data access
+     TRIPLE = 0x50,
+     BIT = 0x51,
+diff --git a/GC/Instruction.h b/GC/Instruction.h
+index f336afb..7a04f64 100644
+--- a/GC/Instruction.h
++++ b/GC/Instruction.h
+@@ -65,6 +65,7 @@ enum
+     SPLIT = 0x248,
+     CONVCBIT2S = 0x249,
+     ANDRSVEC = 0x24a,
++    LOCALAND = 0x24b,
+     // write to clear
+     CLEAR_WRITE = 0x210,
+     XORCBI = 0x210,
+@@ -72,6 +73,7 @@ enum
+     NOTCB = 0x212,
+     CONVCINT = 0x213,
+     REVEAL = 0x214,
++    REVEALSUM = 0x216,
+     STMSDCI = 0x215,
+     LDMCB = 0x217,
+     STMCB = 0x218,
+diff --git a/GC/Processor.h b/GC/Processor.h
+index 226f2cf..2440f69 100644
+--- a/GC/Processor.h
++++ b/GC/Processor.h
+@@ -91,6 +91,17 @@ public:
+     void movsb(const ::BaseInstruction& instruction);
+     void andm(const ::BaseInstruction& instruction);
+     void and_(const ArgVector& args, bool repeat);
++    void localand(const ArgVector& args);
++    void revealsum(const ArgVector& args);
++    template<class U, class V>
++    void xor_memory(const ArgVector& args, const U& registers,
++            const V& indices);
++    template<class U, class V>
++    void and_memory(const ArgVector& args, const U& registers,
++            const V& indices);
++    template<class U, class V>
++    void xor_and_memory(const ArgVector& args, const U& registers,
++            const V& indices);
+     void andrs(const ArgVector& args) { and_(args, true); }
+     void ands(const ArgVector& args) { and_(args, false); }
+     void andrsvec(const ArgVector& args);
+diff --git a/GC/Processor.hpp b/GC/Processor.hpp
+index 4fa33e0..79608b0 100644
+--- a/GC/Processor.hpp
++++ b/GC/Processor.hpp
+@@ -303,6 +303,171 @@ void Processor<T>::andm(const ::BaseInstruction& instruction)
+                 & C[instruction.get_r(2) + i];
+ }
+ 
++template <class T>
++void Processor<T>::localand(const ArgVector& args)
++{
++    if constexpr (requires { T::localand(*this, args); })
++        T::localand(*this, args);
++    else
++        throw runtime_error("LOCALAND is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
++template <class T>
++void Processor<T>::revealsum(const ArgVector& args)
++{
++    if constexpr (requires { T::revealsum(*this, args); })
++        T::revealsum(*this, args);
++    else
++        throw runtime_error("REVEALSUM is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
++/*
++ * dest[dest_index[i]] ^= source[source_index[i]] (or = if args[6] is set)
++ * on entries of DIV_CEIL(args[0], unit) cells of secret bit memory.
++ * registers: integer registers, indices: integer memory.
++ */
++template <class T>
++template <class U, class V>
++void Processor<T>::xor_memory(const ArgVector& args, const U& registers,
++        const V& indices)
++{
++    assert(args.size() == 7);
++    const int n_bits = args[0];
++    const long cells = DIV_CEIL(n_bits, T::default_length);
++    const long dest = registers[args[1]].get();
++    const long dest_index = registers[args[2]].get();
++    const long source = registers[args[3]].get();
++    const long source_index = registers[args[4]].get();
++    const long count = registers[args[5]].get();
++    const bool assign = args[6];
++    auto& M = memories.MS;
++
++    for (long i = 0; i < count; i++)
++    {
++        long d = dest + indices[dest_index + i].get() * cells;
++        long s = source + indices[source_index + i].get() * cells;
++        M.check_index(d + cells - 1);
++        M.check_index(s + cells - 1);
++        for (long j = 0; j < cells; j++)
++        {
++            int n = min(long(T::default_length), n_bits - j * T::default_length);
++            if (assign)
++                M[d + j] = M[s + j];
++            else
++                M[d + j].xor_(n, M[d + j], M[s + j]);
++        }
++    }
++}
++
++/*
++ * dest[i] = a[a_index[i]] AND b[b_index[i]] on entries of
++ * DIV_CEIL(args[0], unit) cells of secret bit memory, for all groups of
++ * seven arguments in one round.
++ */
++template <class T>
++template <class U, class V>
++void Processor<T>::and_memory(const ArgVector& args, const U& registers,
++        const V& indices)
++{
++    assert(args.size() % 7 == 0);
++    auto& M = memories.MS;
++
++    if constexpr (requires (T x) {
++            ShareThread<T>::s().protocol->prepare_mult(x, x, 1, false);
++            ShareThread<T>::s().protocol->finalize_mult(x, 1); })
++    {
++        auto& protocol = *ShareThread<T>::s().protocol;
++        protocol.init_mul();
++        T x, y;
++
++        // calls f(group, i, j, n): entry i of a group, cell j with n bits
++        auto for_all = [&](auto f)
++        {
++            for (size_t g = 0; g < args.size(); g += 7)
++            {
++                const int n_bits = args[g];
++                const long cells = DIV_CEIL(n_bits, T::default_length);
++                const long count = registers[args[g + 6]].get();
++                for (long i = 0; i < count; i++)
++                    for (long j = 0; j < cells; j++)
++                        f(g, i, j, min(long(T::default_length),
++                                n_bits - j * T::default_length), cells);
++            }
++        };
++
++        for_all([&](size_t g, long i, long j, int n, long cells)
++        {
++            long a = registers[args[g + 2]].get()
++                    + indices[registers[args[g + 3]].get() + i].get() * cells + j;
++            long b = registers[args[g + 4]].get()
++                    + indices[registers[args[g + 5]].get() + i].get() * cells + j;
++            M.check_index(a);
++            M.check_index(b);
++            M[a].mask(x, n);
++            M[b].mask(y, n);
++            protocol.prepare_mult(x, y, n, false);
++        });
++
++        protocol.exchange();
++
++        for_all([&](size_t g, long i, long j, int n, long cells)
++        {
++            long d = registers[args[g + 1]].get() + i * cells + j;
++            M.check_index(d);
++            protocol.finalize_mult(M[d], n);
++        });
++    }
++    else
++        throw runtime_error("ANDMEMB is not implemented for this protocol");
++}
++
++/*
++ * dest[dest_index[i]] ^= local product of a[a_index[i]] and b[b_index[i]]
++ * (an additive sharing, see localand) on entries of DIV_CEIL(args[0], unit)
++ * cells of secret bit memory.
++ */
++template <class T>
++template <class U, class V>
++void Processor<T>::xor_and_memory(const ArgVector& args, const U& registers,
++        const V& indices)
++{
++    assert(args.size() == 8);
++    auto& M = memories.MS;
++
++    if constexpr (requires (T x) { x[0] += x.local_mul(x); })
++    {
++        const int n_bits = args[0];
++        const long cells = DIV_CEIL(n_bits, T::default_length);
++        const long dest = registers[args[1]].get();
++        const long dest_index = registers[args[2]].get();
++        const long a = registers[args[3]].get();
++        const long a_index = registers[args[4]].get();
++        const long b = registers[args[5]].get();
++        const long b_index = registers[args[6]].get();
++        const long count = registers[args[7]].get();
++        for (long i = 0; i < count; i++)
++        {
++            long d = dest + indices[dest_index + i].get() * cells;
++            long x = a + indices[a_index + i].get() * cells;
++            long y = b + indices[b_index + i].get() * cells;
++            M.check_index(d + cells - 1);
++            M.check_index(x + cells - 1);
++            M.check_index(y + cells - 1);
++            for (long j = 0; j < cells; j++)
++            {
++                int n = min(long(T::default_length),
++                        n_bits - j * T::default_length);
++                M[d + j][0] += M[x + j].local_mul(M[y + j]).mask(n);
++            }
++        }
++    }
++    else
++        throw runtime_error("XORANDMEMB is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
+ template <class T>
+ void Processor<T>::and_(const ArgVector& args, bool repeat)
+ {
+diff --git a/GC/ShareSecret.h b/GC/ShareSecret.h
+index 8190f92..fb1d3fa 100644
+--- a/GC/ShareSecret.h
++++ b/GC/ShareSecret.h
+@@ -299,6 +299,13 @@ public:
+     SemiHonestRepSecret() {}
+     template<class T>
+     SemiHonestRepSecret(const T& other) : super(other) {}
++
++    // Additive sharing of a AND b, without communication.
++    static void localand(Processor<SemiHonestRepSecret>& processor,
++            const ArgVector& args);
++    // Opens additive (or replicated) sharings in one round.
++    static void revealsum(Processor<SemiHonestRepSecret>& processor,
++            const ArgVector& args);
+ };
+ 
+ }
+diff --git a/GC/ShareSecret.hpp b/GC/ShareSecret.hpp
+index 661c664..d6b843b 100644
+--- a/GC/ShareSecret.hpp
++++ b/GC/ShareSecret.hpp
+@@ -288,6 +288,91 @@ void ShareSecret<U>::reveal_inst(Processor<U>& processor,
+     }
+ }
+ 
++/*
++ * Additive sharing of a AND b. With replicated shares, party i can compute
++ * z_i = a_i b_i + a_i b_{i-1} + a_{i-1} b_i on its own, and the three z_i
++ * add up to the product. The result register holds (z_i, 0): it is not a
++ * replicated sharing, but XOR and AND with clear bits act on it summand by
++ * summand, and so does XOR with a replicated sharing, whose first component
++ * is the party's summand.
++ */
++inline void SemiHonestRepSecret::localand(
++        Processor<SemiHonestRepSecret>& processor, const ArgVector& args)
++{
++    assert(args.size() % 4 == 0);
++    auto& S = processor.S;
++    const int unit = SemiHonestRepSecret::default_length;
++
++    for (size_t i = 0; i < args.size(); i += 4)
++    {
++        int n = args[i];
++        for (int j = 0; j < DIV_CEIL(n, unit); j++)
++        {
++            int n_bits = min(unit, n - j * unit);
++            BitVec z = S[args[i + 2] + j].local_mul(S[args[i + 3] + j]);
++            auto& res = S[args[i + 1] + j];
++            res[0] = z.mask(n_bits);
++            res[1] = 0;
++        }
++    }
++}
++
++/*
++ * Opens sharings given by one summand per party (the first component of
++ * the register). Party i sends z_i = x_i + alpha_i to both other parties,
++ * where the alpha_i are a fresh sharing of zero derived from the pairwise
++ * seeds. Each z_i on its own is masked by a seed that the receiver does not
++ * hold, and the three of them add up to the secret.
++ */
++inline void SemiHonestRepSecret::revealsum(
++        Processor<SemiHonestRepSecret>& processor, const ArgVector& args)
++{
++    auto& party = ShareThread<SemiHonestRepSecret>::s();
++    party.check();
++    assert(args.size() % 3 == 0);
++    auto& protocol = *party.protocol;
++    auto& P = *party.P;
++    auto& S = processor.S;
++    const int unit = SemiHonestRepSecret::default_length;
++
++    vector<BitVec> mine;
++    octetStream os;
++    for (size_t i = 0; i < args.size(); i += 3)
++    {
++        int n = args[i];
++        for (int j = 0; j < DIV_CEIL(n, unit); j++)
++        {
++            int n_bits = min(unit, n - j * unit);
++            BitVec tmp[2];
++            for (int k = 0; k < 2; k++)
++                tmp[k].randomize(protocol.shared_prngs[k], n_bits);
++            BitVec z = (S[args[i + 2] + j][0] + tmp[0] - tmp[1]).mask(n_bits);
++            mine.push_back(z);
++            os.store_int(z.get(), DIV_CEIL(n_bits, 8));
++        }
++    }
++
++    // one round: to and from both other parties
++    vector<octetStream> to_send(3, os), received(3);
++    P.send_receive_all(to_send, received);
++    protocol.rounds++;
++
++    size_t pos = 0;
++    for (size_t i = 0; i < args.size(); i += 3)
++    {
++        int n = args[i];
++        for (int j = 0; j < DIV_CEIL(n, unit); j++)
++        {
++            int n_bits = min(unit, n - j * unit);
++            BitVec res = mine[pos++];
++            for (int k = 0; k < 3; k++)
++                if (k != P.my_num())
++                    res += BitVec(received[k].get_int(DIV_CEIL(n_bits, 8)));
++            processor.C[args[i + 1] + j] = res.mask(n_bits);
++        }
++    }
++}
++
+ template<class U>
+ BitVec ReplicatedSecret<U>::local_mul(const ReplicatedSecret& other) const
+ {
+diff --git a/GC/instructions.h b/GC/instructions.h
+index 6a861c6..526a936 100644
+--- a/GC/instructions.h
++++ b/GC/instructions.h
+@@ -68,6 +68,8 @@
+     X(TRANS, T::trans(PROC, IMM, EXTRA)) \
+     X(BITB, PROC.random_bit(S0)) \
+     X(REVEAL, T::reveal_inst(PROC, EXTRA)) \
++    X(REVEALSUM, PROC.revealsum(EXTRA)) \
++    X(LOCALAND, PROC.localand(EXTRA)) \
+     X(PRINTREGSIGNED, PROC.print_reg_signed(IMM, R0)) \
+     X(PRINTREGB, PROC.print_reg(R0, IMM, SIZE)) \
+     X(PRINTREGPLAINB, PROC.print_reg_plain(C0)) \
+diff --git a/Networking/Player.cpp b/Networking/Player.cpp
+index 347bc0b..0aec4c7 100644
+--- a/Networking/Player.cpp
++++ b/Networking/Player.cpp
+@@ -647,6 +647,29 @@ void Player::send_receive_all(const vector<vector<bool>>& channels,
+   send_receive_all_no_stats(channels, to_send, to_receive);
+ }
+ 
++void Player::send_first_receive_all(const vector<vector<bool>>& channels,
++    const vector<octetStream>& to_send,
++    vector<octetStream>& to_receive) const
++{
++  const int me = my_num();
++  size_t data = 0;
++  for (int i = 0; i < num_players(); i++)
++    if (i != me and channels.at(me).at(i))
++      data += to_send.at(i).get_length();
++  TimeScope ts(comm_stats["Sending/receiving"].add(data));
++  sent += data;
++  to_receive.resize(num_players());
++  for (int i = 0; i < num_players(); i++)
++    if (i != me and channels[me][i] and not channels[i][me])
++      send_to_no_stats(i, to_send[i]);
++  for (int i = 0; i < num_players(); i++)
++    if (i != me and channels[me][i] and channels[i][me])
++      exchange_no_stats(i, to_send[i], to_receive[i]);
++  for (int i = 0; i < num_players(); i++)
++    if (i != me and channels[i][me] and not channels[me][i])
++      receive_player_no_stats(i, to_receive[i]);
++}
++
+ void Player::partial_broadcast(const vector<bool>& senders,
+     const vector<bool>& receivers, vector<octetStream>& os) const
+ {
+diff --git a/Networking/Player.h b/Networking/Player.h
+index 35cfb0c..c049316 100644
+--- a/Networking/Player.h
++++ b/Networking/Player.h
+@@ -399,6 +399,19 @@ public:
+       const vector<octetStream>& to_send,
+       vector<octetStream>& to_receive) const = 0;
+ 
++  /**
++   * One round on specified channels, sending before waiting: first to the
++   * players that send nothing back, then exchanging with the others, then
++   * receiving from the players that only send.
++   * @param channels ``channel[i][j]`` indicates whether party ``i`` sends
++   *   to party ``j``
++   * @param to_send data to send by player number
++   * @param to_receive received data by player number
++   */
++  void send_first_receive_all(const vector<vector<bool>>& channels,
++      const vector<octetStream>& to_send,
++      vector<octetStream>& to_receive) const;
++
+   /**
+    * Specified senders broadcast information to specified receivers.
+    * @param senders specify which parties do send
+diff --git a/Processor/Instruction.h b/Processor/Instruction.h
+index 75e483c..0e5e0bc 100644
+--- a/Processor/Instruction.h
++++ b/Processor/Instruction.h
+@@ -124,6 +124,13 @@ enum
+     APPLYSHUFFLE = 0xFC,
+     DELSHUFFLE = 0xFD,
+     INVPERM = 0xFE,
++    SHUFFLEOPEN = 0xF7,
++    CMPPREP = 0xD4,
++    CMPOPEN = 0xD5,
++    OPENPAIR = 0xD6,
++    XORMEMB = 0xF8,
++    ANDMEMB = 0xEF,
++    XORANDMEMB = 0xF9,
+     // Data access
+     TRIPLE = 0x50,
+     BIT = 0x51,
+diff --git a/Processor/Instruction.hpp b/Processor/Instruction.hpp
+index f5ef393..ee79c4c 100644
+--- a/Processor/Instruction.hpp
++++ b/Processor/Instruction.hpp
+@@ -326,6 +326,13 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
+       case MATMULS:
+       case GMATMULS:
+       case APPLYSHUFFLE:
++      case SHUFFLEOPEN:
++      case CMPPREP:
++      case CMPOPEN:
++      case OPENPAIR:
++      case XORMEMB:
++      case ANDMEMB:
++      case XORANDMEMB:
+       case MATMULSM:
+       case GMATMULSM:
+         num_var_args = get_int(s);
+@@ -484,9 +491,11 @@ void BaseInstruction::parse_operands(istream& s, int pos, int file_pos)
+       case ANDRS:
+       case ANDRSVEC:
+       case ANDS:
++      case LOCALAND:
+       case INPUTB:
+       case INPUTBVEC:
+       case REVEAL:
++      case REVEALSUM:
+         get_vector(get_int(s), start, s);
+         break;
+       case PRINTREGSIGNED:
+@@ -698,6 +707,34 @@ unsigned BaseInstruction::get_max_reg(int reg_type) const
+       else
+           return 0;
+       break;
++  case SHUFFLEOPEN:
++      // size, destination, source, row length, bits, masks, opened
++      // values, blocks, pair
++      if (reg_type == SINT)
++          return start[1] + start[0];
++      else if (reg_type == CINT)
++          return start[6] + start[0] / start[3];
++      else
++          return 0;
++  case CMPPREP:
++      // handle, masks, positions, bits, lanes, left, right
++      if (reg_type == SINT)
++          return start[1] + start[2];
++      else if (reg_type == INT)
++          return start[0] + 1;
++      else
++          return 0;
++  case CMPOPEN:
++  case OPENPAIR:
++      // lanes or size, destination, ...
++      if (reg_type == CINT)
++          return start[1] + start[0];
++      else
++          return 0;
++  case XORMEMB:
++  case ANDMEMB:
++  case XORANDMEMB:
++      return 0;
+   case INPUTMASKREG:
+       if (reg_type == SINT)
+           return r[0] + size;
+@@ -817,6 +854,7 @@ unsigned BaseInstruction::get_max_reg(int reg_type) const
+   case ANDRS:
+   case XORS:
+   case ANDS:
++  case LOCALAND:
+       skip = 4;
+       offset = 1;
+       size_offset = -1;
+@@ -847,6 +885,7 @@ unsigned BaseInstruction::get_max_reg(int reg_type) const
+       size = n;
+       break;
+   case REVEAL:
++  case REVEALSUM:
+       size = DIV_CEIL(n, 64);
+       skip = 3;
+       offset = 1;
+@@ -1224,6 +1263,29 @@ inline void Instruction::execute(Processor<sint, sgf2n>& Proc) const
+       case INVPERM:
+         Proc.Procp.inverse_permutation(*this);
+         return;
++      case SHUFFLEOPEN:
++        Proc.Procp.shuffle_open(*this);
++        return;
++      case CMPPREP:
++        Proc.write_Ci(start[0], Proc.Procp.prepare_compare(*this,
++            Proc.read_Ci(start[5]), Proc.read_Ci(start[6]),
++            Proc.machine.Mi.MC));
++        return;
++      case CMPOPEN:
++        Proc.Procp.compare_open(*this, Proc.read_Ci(start[2]));
++        return;
++      case OPENPAIR:
++        Proc.Procp.open_pair(*this);
++        return;
++      case XORMEMB:
++        Proc.Procb.xor_memory(start, Proc.get_Ci(), Proc.machine.Mi.MC);
++        return;
++      case ANDMEMB:
++        Proc.Procb.and_memory(start, Proc.get_Ci(), Proc.machine.Mi.MC);
++        return;
++      case XORANDMEMB:
++        Proc.Procb.xor_and_memory(start, Proc.get_Ci(), Proc.machine.Mi.MC);
++        return;
+       case CHECK:
+         {
+           CheckJob job;
+diff --git a/Processor/Processor.h b/Processor/Processor.h
+index 7171ddc..c94f7d7 100644
+--- a/Processor/Processor.h
++++ b/Processor/Processor.h
+@@ -101,6 +101,12 @@ public:
+       ShuffleStore& shuffle_store);
+   void apply_shuffle(const Instruction& instruction, ShuffleStore& shuffle_store);
+   void inverse_permutation(const Instruction& instruction);
++  void shuffle_open(const Instruction& instruction);
++  template<class V>
++  long prepare_compare(const Instruction& instruction, long left, long right,
++      const V& positions);
++  void compare_open(const Instruction& instruction, long handle);
++  void open_pair(const Instruction& instruction);
+ 
+   void input_personal(const ArgVector& args);
+   void send_personal(const ArgVector& args);
+diff --git a/Processor/Processor.hpp b/Processor/Processor.hpp
+index 55fd8d0..39c5c1a 100644
+--- a/Processor/Processor.hpp
++++ b/Processor/Processor.hpp
+@@ -995,6 +995,53 @@ void SubProcessor<T>::inverse_permutation(const Instruction& instruction) {
+     maybe_check();
+ }
+ 
++template<class T>
++void SubProcessor<T>::shuffle_open(const Instruction& instruction)
++{
++    const auto& args = instruction.get_start();
++    if constexpr (requires { shuffler.shuffle_open(S, C, args); })
++        shuffler.shuffle_open(S, C, args);
++    else
++        throw runtime_error("SHUFFLEOPEN is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
++template<class T>
++template<class V>
++long SubProcessor<T>::prepare_compare(const Instruction& instruction,
++    long left, long right, const V& positions)
++{
++    const auto& args = instruction.get_start();
++    if constexpr (requires { shuffler.prepare_compare(S, args, left, right,
++            positions); })
++        return shuffler.prepare_compare(S, args, left, right, positions);
++    else
++        throw runtime_error("CMPPREP is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
++template<class T>
++void SubProcessor<T>::compare_open(const Instruction& instruction, long handle)
++{
++    const auto& args = instruction.get_start();
++    if constexpr (requires { shuffler.compare_open(C, args, handle); })
++        shuffler.compare_open(C, args, handle);
++    else
++        throw runtime_error("CMPOPEN is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
++template<class T>
++void SubProcessor<T>::open_pair(const Instruction& instruction)
++{
++    const auto& args = instruction.get_start();
++    if constexpr (requires { shuffler.open_pair(S, C, args); })
++        shuffler.open_pair(S, C, args);
++    else
++        throw runtime_error("OPENPAIR is only implemented for semi-honest "
++                "three-party replicated secret sharing");
++}
++
+ template<class T>
+ void SubProcessor<T>::input_personal(const ArgVector& args)
+ {
+diff --git a/Protocols/Rep3Shuffler.h b/Protocols/Rep3Shuffler.h
+index e5b02b5..272dd27 100644
+--- a/Protocols/Rep3Shuffler.h
++++ b/Protocols/Rep3Shuffler.h
+@@ -8,6 +8,8 @@
+ 
+ #include "SecureShuffle.h"
+ 
++#include <map>
++
+ template<class T>
+ class Rep3Shuffler : public SecureShuffleBase<T>
+ {
+@@ -33,6 +35,43 @@ public:
+ 
+     void shuffle_job(StackedVector<T>& a, const vector<ShuffleTuple<T>>& shuffles,
+             long begin, long end, Player& P, ThreadQueues* queues);
++
++    template<class U>
++    void shuffle_open(StackedVector<T>& S, StackedVector<typename T::clear>& C,
++            const U& args);
++
++    // Comparisons of masked values, with party 0 as dealer (see .hpp).
++    struct CompareLayout
++    {
++        int bits, n_chunks, table_bits, table_bytes;
++        vector<int> width, shift, offset;
++        CompareLayout(int bits);
++        size_t n_subsets() const { return size_t(1) << (n_chunks - 1); }
++    };
++
++    struct CompareMaterial
++    {
++        typedef vector<word> plane;
++        size_t size, lanes;
++        vector<int> left, right;
++        vector<octet> tables;
++        vector<plane> alpha, beta, products;
++        vector<vector<plane>> lower_products;
++        plane top;
++    };
++
++    map<long, CompareMaterial> compare_store;
++    long n_compare = 0;
++
++    template<class U, class V>
++    long prepare_compare(StackedVector<T>& S, const U& args, long left,
++            long right, const V& positions);
++    template<class U>
++    void compare_open(StackedVector<typename T::clear>& C, const U& args,
++            long handle);
++    template<class U>
++    void open_pair(StackedVector<T>& S, StackedVector<typename T::clear>& C,
++            const U& args);
+ };
+ 
+ #endif /* PROTOCOLS_REP3SHUFFLER_H_ */
+diff --git a/Protocols/Rep3Shuffler.hpp b/Protocols/Rep3Shuffler.hpp
+index bc1db14..84950fe 100644
+--- a/Protocols/Rep3Shuffler.hpp
++++ b/Protocols/Rep3Shuffler.hpp
+@@ -190,4 +190,730 @@ void Rep3Shuffler<T>::shuffle_job(StackedVector<T>& a,
+         queues->sync();
+ }
+ 
++/*
++ * Shuffle in two rounds, with the masked opening of one column.
++ *
++ * args: number of registers (rows * unit), destination, source, unit (row
++ * length), n_bits, masks (one register per row), opened values (one clear
++ * register per row), blocks (the rows are divided into this many blocks of
++ * equal size, and rows only move within their block), pair (the masked
++ * values are opened to parties 1 and 2 only, see prepare_compare).
++ *
++ * Party i holds (x_i, x_{i-1}) of x = x_0 + x_1 + x_2 and the seeds s_i
++ * (with party i+1) and s_{i-1}. Every seed gives a permutation of the rows:
++ * pi_a from s_0, pi_b from s_2, pi_c from s_1. The rows are permuted by
++ * pi_c pi_b pi_a, which no party knows.
++ *
++ *   round 1   P0 -> P1:  X2 = pi_b(pi_a(x_0 + x_2 + Z_a) + Z_b)
++ *             P1 -> P2:  Y1 = pi_a(x_1 - Z_a)
++ *   locally   P1:        X3 = pi_c(X2 + Z_c)
++ *             P2:        Y3 = pi_c(pi_b(Y1 - Z_b) - Z_c)
++ *
++ * X3 + Y3 is the permuted array. The new sharing is y_0 from s_0, y_2 from
++ * s_2 and y_1 = (X3 - y_0) + (Y3 - y_2):
++ *
++ *   round 2   P1 -> P2:  X3 - y_0        P2 -> P1:  Y3 - y_2
++ *
++ * If n_bits > 0, the first entry of every shuffled row plus the mask r of
++ * the row is opened modulo 2^n_bits in round 2 as well: with r shared as
++ * (r_0, r_1, r_2), P1 sends X3 + r_0 and P2 sends Y3 + r_1 + r_2 to both
++ * other parties. A receiver lacks one of the summands of r or, in the case
++ * of P0, the mask Z_c, so a single message is uniformly random.
++ */
++template<class T>
++template<class U>
++void Rep3Shuffler<T>::shuffle_open(StackedVector<T>& S,
++        StackedVector<typename T::clear>& C, const U& args)
++{
++    typedef typename T::clear clear;
++
++    assert(proc.P.num_players() == 3);
++    assert(not T::malicious);
++    assert(not T::dishonest_majority);
++    assert(args.size() == 9);
++    const bool pair = args[8];
++
++    const size_t size = args[0], dest = args[1], source = args[2];
++    const size_t unit = args[3];
++    const int n_bits = args[4];
++    const size_t mask = args[5], opened = args[6];
++    const size_t rows = size / unit;
++    const size_t blocks = args[7];
++    const size_t block = rows / blocks;
++    assert(block * blocks * unit == size);
++
++    auto& P = proc.P;
++    auto& prngs = proc.protocol.shared_prngs;
++    const int me = P.my_num();
++
++    // prngs[0] is seed s_me, prngs[1] is seed s_{me-1}
++    auto permutation = [&](PRNG& G)
++    {
++        vector<int> perm(rows);
++        for (size_t j = 0; j < rows; j++)
++            perm[j] = j;
++        for (size_t start = 0; start < rows; start += block)
++            for (size_t j = 0; j < block; j++)
++                swap(perm[start + j],
++                        perm[start + j + G.get_uint_lemire(block - j)]);
++        return perm;
++    };
++    auto randoms = [&](PRNG& G)
++    {
++        vector<clear> res(size);
++        for (auto& x : res)
++            x.randomize(G);
++        return res;
++    };
++    auto permute = [&](const vector<clear>& in, const vector<int>& perm)
++    {
++        vector<clear> res(size);
++        for (size_t j = 0; j < rows; j++)
++            for (size_t k = 0; k < unit; k++)
++                res[j * unit + k] = in[perm[j] * unit + k];
++        return res;
++    };
++    auto pack = [&](const vector<clear>& values, octetStream& os)
++    {
++        os.reserve(values.size() * clear::size());
++        for (auto& x : values)
++            x.pack(os);
++    };
++    auto unpack = [&](size_t n, octetStream& os)
++    {
++        vector<clear> res(n);
++        for (auto& x : res)
++            x.unpack(os);
++        return res;
++    };
++
++    vector<vector<bool>> first(3, vector<bool>(3)), second(3, vector<bool>(3));
++    first[0][1] = first[1][2] = true;
++    second[1][2] = second[2][1] = true;
++    if (n_bits > 0 and not pair)
++        second[1][0] = second[2][0] = true;
++    vector<octetStream> to_send(3), received(3);
++
++    // summand of the masked values that this party sends, reduced to n_bits
++    auto reduce = [&](clear x)
++    {
++        return n_bits < 64 ? clear(x << (64 - n_bits)) : x;
++    };
++
++    if (me == 0)
++    {
++        auto pi_a = permutation(prngs[0]);
++        auto pi_b = permutation(prngs[1]);
++        vector<clear> x(size);
++        auto z_a = randoms(prngs[0]);
++        for (size_t j = 0; j < size; j++)
++            x[j] = S[source + j].sum() + z_a[j];
++        x = permute(x, pi_a);
++        auto z_b = randoms(prngs[1]);
++        for (size_t j = 0; j < size; j++)
++            x[j] += z_b[j];
++        x = permute(x, pi_b);
++        pack(x, to_send[1]);
++        P.send_first_receive_all(first, to_send, received);
++
++        auto y_0 = randoms(prngs[0]);
++        auto y_2 = randoms(prngs[1]);
++        for (size_t j = 0; j < size; j++)
++        {
++            S[dest + j][0] = y_0[j];
++            S[dest + j][1] = y_2[j];
++        }
++
++        if (n_bits > 0 and not pair)
++        {
++            for (auto& os : to_send)
++                os.reset_write_head();
++            P.send_first_receive_all(second, to_send, received);
++            auto u_1 = unpack(rows, received[1]);
++            auto u_2 = unpack(rows, received[2]);
++            for (size_t j = 0; j < rows; j++)
++                C[opened + j] = clear(u_1[j] + u_2[j]) >> (64 - n_bits);
++        }
++    }
++    else if (me == 1)
++    {
++        auto pi_a = permutation(prngs[1]);
++        auto pi_c = permutation(prngs[0]);
++        vector<clear> y(size);
++        auto z_a = randoms(prngs[1]);
++        for (size_t j = 0; j < size; j++)
++            y[j] = S[source + j][0] - z_a[j];
++        y = permute(y, pi_a);
++        pack(y, to_send[2]);
++        P.send_first_receive_all(first, to_send, received);
++
++        auto x = unpack(size, received[0]);
++        auto z_c = randoms(prngs[0]);
++        for (size_t j = 0; j < size; j++)
++            x[j] += z_c[j];
++        x = permute(x, pi_c);
++
++        auto y_0 = randoms(prngs[1]);
++        vector<clear> c_1(size), u_1;
++        for (size_t j = 0; j < size; j++)
++            c_1[j] = x[j] - y_0[j];
++        for (auto& os : to_send)
++            os.reset_write_head();
++        pack(c_1, to_send[2]);
++        if (n_bits > 0)
++        {
++            for (size_t j = 0; j < rows; j++)
++                u_1.push_back(reduce(x[j * unit] + S[mask + j][1]));
++            pack(u_1, to_send[2]);
++            if (not pair)
++                pack(u_1, to_send[0]);
++        }
++        P.send_first_receive_all(second, to_send, received);
++
++        auto c_2 = unpack(size, received[2]);
++        for (size_t j = 0; j < size; j++)
++        {
++            S[dest + j][0] = c_1[j] + c_2[j];
++            S[dest + j][1] = y_0[j];
++        }
++        if (n_bits > 0)
++        {
++            auto u_2 = unpack(rows, received[2]);
++            for (size_t j = 0; j < rows; j++)
++                C[opened + j] = clear(u_1[j] + u_2[j]) >> (64 - n_bits);
++        }
++    }
++    else
++    {
++        auto pi_b = permutation(prngs[0]);
++        auto pi_c = permutation(prngs[1]);
++        P.send_first_receive_all(first, to_send, received);
++
++        auto y = unpack(size, received[1]);
++        auto z_b = randoms(prngs[0]);
++        for (size_t j = 0; j < size; j++)
++            y[j] -= z_b[j];
++        y = permute(y, pi_b);
++        auto z_c = randoms(prngs[1]);
++        for (size_t j = 0; j < size; j++)
++            y[j] -= z_c[j];
++        y = permute(y, pi_c);
++
++        auto y_2 = randoms(prngs[0]);
++        vector<clear> c_2(size), u_2;
++        for (size_t j = 0; j < size; j++)
++            c_2[j] = y[j] - y_2[j];
++        pack(c_2, to_send[1]);
++        if (n_bits > 0)
++        {
++            for (size_t j = 0; j < rows; j++)
++                u_2.push_back(reduce(y[j * unit] + S[mask + j].sum()));
++            pack(u_2, to_send[1]);
++            if (not pair)
++                pack(u_2, to_send[0]);
++        }
++        P.send_first_receive_all(second, to_send, received);
++
++        auto c_1 = unpack(size, received[1]);
++        for (size_t j = 0; j < size; j++)
++        {
++            S[dest + j][0] = y_2[j];
++            S[dest + j][1] = c_1[j] + c_2[j];
++        }
++        if (n_bits > 0)
++        {
++            auto u_1 = unpack(rows, received[1]);
++            for (size_t j = 0; j < rows; j++)
++                C[opened + j] = clear(u_1[j] + u_2[j]) >> (64 - n_bits);
++        }
++    }
++
++    stats[rows] += unit;
++}
++
++/*
++ * Comparisons with party 0 as dealer.
++ *
++ * The values to compare sit at `size` positions; lane l compares the values
++ * at positions left[l] and right[l]. Party 0 chooses a mask r_i of `bits`
++ * bits for every position and never sees a masked value; parties 1 and 2
++ * see the masked values c_i = x_i + r_i but each knows only one of two
++ * summands of r_i. With rho = r_left - r_right,
++ *
++ *     x_left - x_right = (c_left - c_right) - rho      (modulo 2^bits),
++ *
++ * so the sign of the difference follows from the top bits and from whether
++ * the low bits of c_left - c_right are below those of rho. The low bits
++ * are cut into chunks. For every chunk, party 0 shares the table
++ * v -> [chunk of rho >= v] between parties 1 and 2, who look up, for the
++ * public chunk value v, shares of lt = [rho's chunk > v] and
++ * eq = [rho's chunk = v]. Then
++ *
++ *     [c < rho] = XOR_k  lt_k AND eq_{k+1} AND ... AND eq_{m-1}.
++ *
++ * Parties 1 and 2 open lt_k + alpha_k and eq_j + beta_j for random bits
++ * alpha, beta shared by party 0, expand the products and combine shares of
++ * the products of the alpha and beta, which party 0 also provides. That
++ * takes one round, opening the result another.
++ *
++ * Everything party 0 provides comes from the seed it shares with party 1,
++ * except for what it sends to party 2 in one message. Party 0 learns the
++ * comparison results only; a party that sees the c_i lacks one summand of
++ * every mask, table and product.
++ */
++template<class T>
++Rep3Shuffler<T>::CompareLayout::CompareLayout(int bits) : bits(bits)
++{
++    // chunks: the number that minimises what party 0 has to send
++    int low = bits - 1;
++    assert(low > 0 and low <= 62);
++    long best = -1;
++    n_chunks = 0;
++    for (int m = 1; m <= 10 and m <= low; m++)
++    {
++        if (DIV_CEIL(low, m) > 12)
++            continue;
++        long cost = (1L << (m - 1)) + (1L << m);
++        for (int k = 0; k < m; k++)
++            cost += (1L << (low / m + (k < low % m))) + 1;
++        if (best < 0 or cost < best)
++        {
++            best = cost;
++            n_chunks = m;
++        }
++    }
++    assert(n_chunks > 0);
++    table_bits = 0;
++    int pos = 0;
++    for (int k = 0; k < n_chunks; k++)
++    {
++        width.push_back(low / n_chunks + (k < low % n_chunks));
++        shift.push_back(pos);
++        offset.push_back(table_bits);
++        pos += width[k];
++        table_bits += (1 << width[k]) + 1;
++    }
++    table_bytes = DIV_CEIL(table_bits, 8);
++}
++
++/*
++ * args: -, destination of the masks (one secret register per position),
++ * size, bits, lanes. left, right: addresses of the positions of every lane
++ * in the integer memory `positions`. Returns a handle for compare_open.
++ */
++template<class T>
++template<class U, class V>
++long Rep3Shuffler<T>::prepare_compare(StackedVector<T>& S, const U& args,
++        long left, long right, const V& positions)
++{
++    typedef typename CompareMaterial::plane plane;
++
++    assert(proc.P.num_players() == 3);
++    assert(not T::malicious);
++    assert(not T::dishonest_majority);
++
++    auto& P = proc.P;
++    auto& prngs = proc.protocol.shared_prngs;
++    const int me = P.my_num();
++    const size_t mask = args[1], size = args[2];
++    const int bits = args[3];
++    const size_t lanes = args[4];
++    const size_t words = DIV_CEIL(lanes, 64);
++    const word low_bits = (word(1) << bits) - 1;
++
++    CompareLayout layout(bits);
++    const int m = layout.n_chunks;
++    const size_t n_subsets = layout.n_subsets();
++
++    auto& material = compare_store[n_compare];
++    material.size = size;
++    material.lanes = lanes;
++    for (size_t l = 0; l < lanes; l++)
++    {
++        material.left.push_back(positions[left + l].get());
++        material.right.push_back(positions[right + l].get());
++    }
++
++    auto random_words = [&](PRNG& G, size_t n)
++    {
++        vector<word> res(n);
++        G.get_octets((octet*) res.data(), n * sizeof(word));
++        return res;
++    };
++    auto random_plane = [&](PRNG& G) { return random_words(G, words); };
++    auto add = [&](const plane& x, const plane& y)
++    {
++        plane res(words);
++        for (size_t i = 0; i < words; i++)
++            res[i] = x[i] ^ y[i];
++        return res;
++    };
++    auto mul = [&](const plane& x, const plane& y)
++    {
++        plane res(words);
++        for (size_t i = 0; i < words; i++)
++            res[i] = x[i] & y[i];
++        return res;
++    };
++    // subsets S of {1..m-1} are bit masks shifted by one; these are the
++    // ones with at least two elements, and the non-empty subsets of
++    // {k+1..m-1}
++    auto large = [&](size_t s) { return (s & (s - 1)) != 0; };
++    auto above = [&](size_t s, int k) { return s != 0 and (s >> k) << k == s; };
++
++    vector<vector<bool>> channels(3, vector<bool>(3));
++    channels[0][2] = true;
++    vector<octetStream> to_send(3), received(3);
++
++    material.products.resize(n_subsets);
++    material.lower_products.assign(m, vector<plane>(n_subsets));
++
++    if (me == 0)
++    {
++        // seed with party 1, seed with party 2
++        auto& G1 = prngs[0];
++        auto& G2 = prngs[1];
++        auto r_1 = random_words(G1, size);
++        auto r_2 = random_words(G2, size);
++        for (size_t i = 0; i < size; i++)
++        {
++            r_1[i] &= low_bits;
++            r_2[i] &= low_bits;
++            S[mask + i][0] = typename T::clear(r_1[i]);
++            S[mask + i][1] = typename T::clear(r_2[i]);
++        }
++
++        // tables: entry v of chunk k is [chunk >= v]
++        vector<octet> tables(lanes * layout.table_bytes);
++        G1.get_octets(tables.data(), tables.size());
++        plane top(words);
++        for (size_t l = 0; l < lanes; l++)
++        {
++            word rho = (r_1[material.left[l]] + r_2[material.left[l]]
++                    - r_1[material.right[l]] - r_2[material.right[l]])
++                    & low_bits;
++            octet* table = &tables[l * layout.table_bytes];
++            for (int k = 0; k < m; k++)
++            {
++                size_t chunk = (rho >> layout.shift[k])
++                        & ((word(1) << layout.width[k]) - 1);
++                size_t first = layout.offset[k];
++                for (size_t v = first; v <= first + chunk; v++)
++                    table[v / 8] ^= 1 << (v % 8);
++            }
++            top[l / 64] |= ((rho >> (bits - 1)) & 1) << (l % 64);
++        }
++        auto& os = to_send[2];
++        os.append(tables.data(), tables.size());
++        auto send = [&](const plane& x)
++        {
++            os.append((octet*) x.data(), words * sizeof(word));
++        };
++
++        vector<plane> alpha, beta(1), all(n_subsets);
++        for (int k = 0; k < m; k++)
++            alpha.push_back(random_plane(G1));
++        for (int j = 1; j < m; j++)
++            beta.push_back(random_plane(G1));
++        for (int k = 0; k < m; k++)
++            alpha[k] = add(alpha[k], random_plane(G2));
++        for (int j = 1; j < m; j++)
++            beta[j] = add(beta[j], random_plane(G2));
++        // products of the beta
++        all[0] = plane(words, word(-1));
++        for (size_t s = 1; s < n_subsets; s++)
++        {
++            int j = __builtin_ctzl(s);
++            all[s] = mul(all[s & (s - 1)], beta[j + 1]);
++        }
++        for (size_t s = 1; s < n_subsets; s++)
++            if (large(s))
++                send(add(all[s], random_plane(G1)));
++        for (int k = 0; k < m; k++)
++            for (size_t s = 1; s < n_subsets; s++)
++                if (above(s, k))
++                    send(add(mul(alpha[k], all[s]), random_plane(G1)));
++        send(add(top, random_plane(G1)));
++        P.send_first_receive_all(channels, to_send, received);
++    }
++    else if (me == 1)
++    {
++        auto& G = prngs[1];
++        auto r = random_words(G, size);
++        for (size_t i = 0; i < size; i++)
++        {
++            S[mask + i][0] = {};
++            S[mask + i][1] = typename T::clear(r[i] & low_bits);
++        }
++        material.tables.resize(lanes * layout.table_bytes);
++        G.get_octets(material.tables.data(), material.tables.size());
++        for (int k = 0; k < m; k++)
++            material.alpha.push_back(random_plane(G));
++        material.beta.resize(1);
++        for (int j = 1; j < m; j++)
++            material.beta.push_back(random_plane(G));
++        for (size_t s = 1; s < n_subsets; s++)
++            if (large(s))
++                material.products[s] = random_plane(G);
++        for (int k = 0; k < m; k++)
++            for (size_t s = 1; s < n_subsets; s++)
++                if (above(s, k))
++                    material.lower_products[k][s] = random_plane(G);
++        material.top = random_plane(G);
++        P.send_first_receive_all(channels, to_send, received);
++    }
++    else
++    {
++        auto& G = prngs[0];
++        auto r = random_words(G, size);
++        for (size_t i = 0; i < size; i++)
++        {
++            S[mask + i][0] = typename T::clear(r[i] & low_bits);
++            S[mask + i][1] = {};
++        }
++        for (int k = 0; k < m; k++)
++            material.alpha.push_back(random_plane(G));
++        material.beta.resize(1);
++        for (int j = 1; j < m; j++)
++            material.beta.push_back(random_plane(G));
++        P.send_first_receive_all(channels, to_send, received);
++        auto& os = received[0];
++        material.tables.resize(lanes * layout.table_bytes);
++        os.consume(material.tables.data(), material.tables.size());
++        auto receive = [&]()
++        {
++            plane res(words);
++            os.consume((octet*) res.data(), words * sizeof(word));
++            return res;
++        };
++        for (size_t s = 1; s < n_subsets; s++)
++            if (large(s))
++                material.products[s] = receive();
++        for (int k = 0; k < m; k++)
++            for (size_t s = 1; s < n_subsets; s++)
++                if (above(s, k))
++                    material.lower_products[k][s] = receive();
++        material.top = receive();
++    }
++
++    if (me != 0)
++    {
++        // products of one element are the shares of alpha and beta
++        for (int j = 1; j < m; j++)
++            material.products[size_t(1) << (j - 1)] = material.beta[j];
++    }
++
++    return n_compare++;
++}
++
++/*
++ * args: lanes, destination (one clear register per lane, 1 if the value at
++ * the left position is smaller), -, masked values (one clear register per
++ * position, as parties 1 and 2 see them), bits. Two rounds. The material
++ * of the handle is used up.
++ */
++template<class T>
++template<class U>
++void Rep3Shuffler<T>::compare_open(StackedVector<typename T::clear>& C,
++        const U& args, long handle)
++{
++    typedef typename CompareMaterial::plane plane;
++    typedef typename T::clear clear;
++
++    auto& P = proc.P;
++    auto& prngs = proc.protocol.shared_prngs;
++    const int me = P.my_num();
++    const size_t lanes = args[0], dest = args[1], opened = args[3];
++    const int bits = args[4];
++    const size_t words = DIV_CEIL(lanes, 64);
++
++    auto it = compare_store.find(handle);
++    if (it == compare_store.end())
++        throw runtime_error("comparison material missing or used before");
++    auto& material = it->second;
++    if (material.lanes != lanes)
++        throw runtime_error("comparison material does not fit");
++
++    CompareLayout layout(bits);
++    const int m = layout.n_chunks;
++    const size_t n_subsets = layout.n_subsets();
++
++    vector<vector<bool>> first(3, vector<bool>(3)), second(3, vector<bool>(3));
++    first[1][2] = first[2][1] = true;
++    second[1][2] = second[2][1] = second[1][0] = second[2][0] = true;
++    vector<octetStream> to_send(3), received(3);
++    plane result(words);
++
++    if (me == 0)
++    {
++        P.send_first_receive_all(first, to_send, received);
++        P.send_first_receive_all(second, to_send, received);
++        for (int k = 1; k <= 2; k++)
++            for (size_t i = 0; i < words; i++)
++            {
++                word x;
++                received[k].consume((octet*) &x, sizeof(word));
++                result[i] ^= x;
++            }
++    }
++    else
++    {
++        const int other = 3 - me;
++        const word low_bits = (word(1) << bits) - 1;
++        // shares of lt_k and eq_k for the public chunk values, then masked
++        vector<plane> lt(m, plane(words)), eq(m, plane(words));
++        plane top(words);
++        for (size_t l = 0; l < lanes; l++)
++        {
++            word diff = (C[opened + material.left[l]].get_limb(0)
++                    - C[opened + material.right[l]].get_limb(0)) & low_bits;
++            const octet* table = &material.tables[l * layout.table_bytes];
++            for (int k = 0; k < m; k++)
++            {
++                size_t v = layout.offset[k] + ((diff >> layout.shift[k])
++                        & ((word(1) << layout.width[k]) - 1));
++                word at_least = (table[v / 8] >> (v % 8)) & 1;
++                word larger = (table[(v + 1) / 8] >> ((v + 1) % 8)) & 1;
++                lt[k][l / 64] |= larger << (l % 64);
++                eq[k][l / 64] |= (at_least ^ larger) << (l % 64);
++            }
++            top[l / 64] |= (diff >> (bits - 1)) << (l % 64);
++        }
++        auto& os = to_send[other];
++        for (int k = 0; k < m; k++)
++        {
++            for (size_t i = 0; i < words; i++)
++                lt[k][i] ^= material.alpha[k][i];
++            os.append((octet*) lt[k].data(), words * sizeof(word));
++        }
++        for (int j = 1; j < m; j++)
++        {
++            for (size_t i = 0; i < words; i++)
++                eq[j][i] ^= material.beta[j][i];
++            os.append((octet*) eq[j].data(), words * sizeof(word));
++        }
++        P.send_first_receive_all(first, to_send, received);
++        auto& is = received[other];
++        for (int k = 0; k < m; k++)
++            for (size_t i = 0; i < words; i++)
++            {
++                word x;
++                is.consume((octet*) &x, sizeof(word));
++                lt[k][i] ^= x;
++            }
++        for (int j = 1; j < m; j++)
++            for (size_t i = 0; i < words; i++)
++            {
++                word x;
++                is.consume((octet*) &x, sizeof(word));
++                eq[j][i] ^= x;
++            }
++
++        // lt and eq now hold d_k = lt_k + alpha_k and e_j = eq_j + beta_j.
++        // (d_k + alpha_k) prod_{j > k} (e_j + beta_j) is the sum over the
++        // subsets S of {k+1..m-1} of
++        //   prod_{j not in S} e_j * (d_k * prod_S beta + alpha_k * prod_S beta).
++        vector<plane> public_products(n_subsets);
++        public_products[0] = plane(words, word(-1));
++        for (size_t s = 1; s < n_subsets; s++)
++        {
++            int j = __builtin_ctzl(s);
++            auto& smaller = public_products[s & (s - 1)];
++            public_products[s].resize(words);
++            for (size_t i = 0; i < words; i++)
++                public_products[s][i] = smaller[i] & eq[j + 1][i];
++        }
++        // the public summand goes to party 1
++        if (me == 1)
++            result = top;
++        for (size_t i = 0; i < words; i++)
++            result[i] ^= material.top[i];
++        for (int k = 0; k < m; k++)
++        {
++            // subsets of {k+1..m-1}
++            size_t all = (n_subsets - 1) >> k << k;
++            for (size_t s = all;; s = (s - 1) & all)
++            {
++                auto& factor = public_products[all & ~s];
++                const plane* betas = s ? &material.products[s] : 0;
++                const plane& both = s ? material.lower_products[k][s]
++                        : material.alpha[k];
++                for (size_t i = 0; i < words; i++)
++                {
++                    word share = both[i];
++                    if (betas)
++                        share ^= lt[k][i] & (*betas)[i];
++                    else if (me == 1)
++                        share ^= lt[k][i];
++                    result[i] ^= factor[i] & share;
++                }
++                if (s == 0)
++                    break;
++            }
++        }
++
++        // open: a pad that party 0 does not know hides the shares
++        vector<word> pad(words);
++        prngs[me == 1 ? 0 : 1].get_octets((octet*) pad.data(),
++                words * sizeof(word));
++        for (size_t i = 0; i < words; i++)
++            result[i] ^= pad[i];
++        for (int k = 0; k < 3; k++)
++            to_send[k].reset_write_head();
++        to_send[other].append((octet*) result.data(), words * sizeof(word));
++        to_send[0].append((octet*) result.data(), words * sizeof(word));
++        P.send_first_receive_all(second, to_send, received);
++        for (size_t i = 0; i < words; i++)
++        {
++            word x;
++            received[other].consume((octet*) &x, sizeof(word));
++            result[i] ^= x;
++        }
++    }
++
++    for (size_t l = 0; l < lanes; l++)
++        C[dest + l] = clear((result[l / 64] >> (l % 64)) & 1);
++    compare_store.erase(it);
++}
++
++/*
++ * Opens the low n_bits bits of secret registers to parties 1 and 2 only:
++ * each of them sends the other the summand that the other lacks.
++ * args: size, destination (clear), source (secret), n_bits.
++ */
++template<class T>
++template<class U>
++void Rep3Shuffler<T>::open_pair(StackedVector<T>& S,
++        StackedVector<typename T::clear>& C, const U& args)
++{
++    typedef typename T::clear clear;
++
++    auto& P = proc.P;
++    const int me = P.my_num();
++    const size_t size = args[0], dest = args[1], source = args[2];
++    const int n_bits = args[3];
++
++    vector<vector<bool>> channels(3, vector<bool>(3));
++    channels[1][2] = channels[2][1] = true;
++    vector<octetStream> to_send(3), received(3);
++    if (me != 0)
++    {
++        // party i holds (x_i, x_{i-1}); 1 lacks x_2, 2 lacks x_0
++        const int other = 3 - me;
++        for (size_t i = 0; i < size; i++)
++            clear(S[source + i][me == 1 ? 1 : 0] << (64 - n_bits)).pack(
++                    to_send[other]);
++        P.send_first_receive_all(channels, to_send, received);
++        for (size_t i = 0; i < size; i++)
++        {
++            clear x;
++            x.unpack(received[other]);
++            C[dest + i] = clear(x + (S[source + i].sum() << (64 - n_bits)))
++                    >> (64 - n_bits);
++        }
++    }
++    else
++        P.send_first_receive_all(channels, to_send, received);
++}
++
+ #endif

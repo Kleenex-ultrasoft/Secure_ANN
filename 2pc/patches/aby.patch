@@ -1,0 +1,29 @@
+diff --git a/src/abycore/sharing/arithsharing.cpp b/src/abycore/sharing/arithsharing.cpp
+index 20e9fd5..41b42df 100644
+--- a/src/abycore/sharing/arithsharing.cpp
++++ b/src/abycore/sharing/arithsharing.cpp
+@@ -1158,6 +1158,7 @@ void ArithSharing<T>::Reset() {
+ 	for (uint32_t i = 0; i < m_vA.size(); i++) {
+ 		m_vA[i].delCBitVector();
+ 		m_vB[i].delCBitVector();
++		m_vC[i].delCBitVector();
+ 		m_vS[i].delCBitVector();
+ 		m_vD_snd[i].delCBitVector();
+ 		m_vE_snd[i].delCBitVector();
+diff --git a/src/abycore/sharing/yaoserversharing.cpp b/src/abycore/sharing/yaoserversharing.cpp
+index 26ea064..dfa2548 100644
+--- a/src/abycore/sharing/yaoserversharing.cpp
++++ b/src/abycore/sharing/yaoserversharing.cpp
+@@ -111,7 +111,11 @@ void YaoServerSharing::PrepareSetupPhase(ABYSetup* setup) {
+ 	m_vROTMasks[0].Create((m_nClientInputBits + m_nConversionInputBits) * symbits);
+ 	m_vROTMasks[1].Create((m_nClientInputBits + m_nConversionInputBits) * symbits);
+ 
+-	CreateRandomWireKeys(m_vServerInputKeys, m_nServerInputBits + m_cBoolCircuit->GetNumA2YGates());
++	// Server input keys are addressed with m_nPermBitCtr, which also advances
++	// on B2Y and role-switch conversion gates.  Size the buffer for every
++	// position that counter can take; with one key per server input and A2Y
++	// bit only, A2Y gates that follow a B2Y gate read past the end.
++	CreateRandomWireKeys(m_vServerInputKeys, m_nServerInputBits + m_nConversionInputBits);
+ 	CreateRandomWireKeys(m_vClientInputKeys, m_nClientInputBits + m_nConversionInputBits);
+ 	//CreateRandomWireKeys(m_vConversionInputKeys, m_nConversionInputBits);
+ 

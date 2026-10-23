@@ -60,7 +60,14 @@ python3 3pc/bench/run_search.py --index index.npz --queries query.npy --num 4 \
 ```
 
 `base.npy` is an `(N, d)` array; coordinates are quantised to 8 bits, and
-`query.npy` holds uint8 vectors on the same scale.  The
+`query.npy` holds uint8 vectors on the same scale (`build_index.py --queries`
+writes them).
+
+The index is built offline with faiss, efConstruction 1000.  Every neighbour
+list has M slots and the protocols pay for all of them; HNSW keeps fewer
+neighbours than that, so the free slots hold the nearest nodes of the layer
+that are not neighbours yet (`--pad dummy` leaves them unused).  Neither
+choice changes the protocols or their cost.  The
 drivers run all parties on the local machine, search the layers from the top,
 and print recall against exact search together with latency, communication
 and rounds.
